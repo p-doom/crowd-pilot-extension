@@ -9,14 +9,12 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      {
-        "command": "crowd-pilot.helloWorld",
-        "title": "Hello World!"
-      },
       {
         "command": "crowd-pilot.testRun",
         "title": "Test Run"
