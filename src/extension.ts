@@ -141,7 +141,10 @@ function showPreviewUI(plan: PlannedAction[]): void {
 			case 'showTextDocument':
 				return { index, label: '$(file) Focus active text document' };
 			case 'setSelections':
-				return { index, label: '$(cursor) Move cursor to selection(s)' };
+				{
+					const cursors = action.selections.map(s => `(${s.start[0]}, ${s.start[1]})`).join(', ');
+					return { index, label: `$(cursor) Move cursor to ${cursors}` };
+				}
 			case 'editInsert':
 				return { index, label: `$(pencil) Insert "${action.text.replace(/\n/g, '\\n')}" at (${action.position[0]}, ${action.position[1]})` };
 			case 'terminalShow':
