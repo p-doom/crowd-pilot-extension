@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 
 export function activate(context: vscode.ExtensionContext) {
 
-	console.log('[Crowd Pilot] Extension activated');
+	console.log('[crowd-pilot] Extension activated');
 
 	// Configure terminal to allow tab keybinding to work
 	(async () => {
@@ -22,7 +22,7 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		// Prime terminal subsystem after intercept is enabled (NOTE: this is a workaround)
 		await primeTerminalSubsystem();
-	})().catch((err) => console.error('[Crowd Pilot] Startup initialization error:', err));
+	})().catch((err) => console.error('[crowd-pilot] Startup initialization error:', err));
 
 	const testRun = vscode.commands.registerCommand('crowd-pilot.testRun', async () => {
 		const editor = vscode.window.activeTextEditor;
@@ -33,14 +33,15 @@ export function activate(context: vscode.ExtensionContext) {
 		const term = vscode.window.terminals[0] ?? vscode.window.createTerminal('Test');
 		const plan = buildTestRunPlan(editor, doc, term);
 
-		if (!uiPanel) {
+		if (!previewVisible) {
 			showPreviewUI(plan);
 			return;
 		}
 
+		const runPlan = currentPlan ?? plan;
 		hidePreviewUI();
 
-		await executePlan(plan);
+		await executePlan(runPlan);
 		vscode.window.showInformationMessage('All actions emitted');
 	  });
 
@@ -64,16 +65,16 @@ async function primeTerminalSubsystem(): Promise<void> {
 				resolve();
 			});
 		});
-		const t = vscode.window.createTerminal('Crowd Pilot Prime');
+		const t = vscode.window.createTerminal('crowd-pilot prime');
 		await Promise.race([
 			opened,
 			new Promise<void>(r => setTimeout(r, 150))
 		]);
 		try { t.dispose(); } catch {}
 		await new Promise<void>(r => setTimeout(r, 50));
-		console.log('[Crowd Pilot] Primed terminal subsystem');
+		console.log('[crowd-pilot] Primed terminal subsystem');
 	} catch (err) {
-		console.error('[Crowd Pilot] Failed to prime terminal subsystem:', err);
+		console.error('[crowd-pilot] Failed to prime terminal subsystem:', err);
 	}
 }
 
@@ -84,6 +85,8 @@ type PlannedAction =
 | { kind: 'editInsert', position: [number, number], text: string }
 | { kind: 'terminalShow' }
 | { kind: 'terminalSendText', text: string };
+
+let currentPlan: PlannedAction[] | undefined;
 
 function buildTestRunPlan(_editor: vscode.TextEditor, _doc: vscode.TextDocument, _term: vscode.Terminal): PlannedAction[] {
 	const plan: PlannedAction[] = [];
@@ -129,87 +132,59 @@ async function executePlan(plan: PlannedAction[]): Promise<void> {
 
 // -------------------- UI State & Helpers --------------------
 const UI_CONTEXT_KEY = 'crowdPilot.uiVisible';
-let uiPanel: vscode.WebviewPanel | undefined;
+let previewVisible = false;
+let previewQuickPick: vscode.QuickPick<(vscode.QuickPickItem & { index: number })> | undefined;
 
 function showPreviewUI(plan: PlannedAction[]): void {
-	if (uiPanel) {
-		try {
-			uiPanel.reveal(undefined, true /* preserveFocus */);
-		} catch {}
-		uiPanel.webview.html = getPreviewHtml(plan);
-		return;
-	}
-	uiPanel = vscode.window.createWebviewPanel(
-		'crowdPilotPreview',
-		'Crowd Pilot Preview',
-		{ viewColumn: vscode.ViewColumn.Beside, preserveFocus: true },
-		{ enableScripts: false, retainContextWhenHidden: false }
-	);
-	uiPanel.webview.html = getPreviewHtml(plan);
-	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
-	uiPanel.onDidDispose(() => {
-		uiPanel = undefined;
-		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+	const items: (vscode.QuickPickItem & { index: number })[] = plan.map((action, index) => {
+		switch (action.kind) {
+			case 'showTextDocument':
+				return { index, label: '$(file) Focus active text document' };
+			case 'setSelections':
+				return { index, label: '$(cursor) Move cursor to selection(s)' };
+			case 'editInsert':
+				return { index, label: `$(pencil) Insert "${action.text.replace(/\n/g, '\\n')}" at (${action.position[0]}, ${action.position[1]})` };
+			case 'terminalShow':
+				return { index, label: '$(terminal) Focus terminal' };
+			case 'terminalSendText':
+				return { index, label: `$(terminal) Run "${action.text}" in terminal` };
+		}
 	});
+    if (!previewQuickPick) {
+        previewQuickPick = vscode.window.createQuickPick<(vscode.QuickPickItem & { index: number })>();
+		previewQuickPick.title = 'crowd-pilot: preview';
+		previewQuickPick.matchOnDetail = true;
+		previewQuickPick.ignoreFocusOut = true;
+		previewQuickPick.canSelectMany = false;
+        previewQuickPick.onDidAccept(async () => {
+            const qp = previewQuickPick!;
+            const selected = qp.selectedItems?.[0];
+            qp.hide();
+            if (selected) {
+                await executePlan([plan[selected.index]]);
+                vscode.window.showInformationMessage('Action executed');
+            }
+        });
+		previewQuickPick.onDidHide(() => {
+			previewVisible = false;
+			vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+			try { previewQuickPick?.dispose(); } catch {}
+			previewQuickPick = undefined;
+		});
+	}
+	previewQuickPick.items = items;
+	previewQuickPick.placeholder = 'Press Tab to run all, Enter for selected, or Esc to hide';
+	previewQuickPick.show();
+	previewVisible = true;
+	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
+	currentPlan = plan;
 }
 
 function hidePreviewUI(): void {
-	if (!uiPanel) {
-		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+	if (previewQuickPick) {
+		try { previewQuickPick.hide(); } catch {}
 		return;
 	}
-	try { uiPanel.dispose(); } catch {}
-	uiPanel = undefined;
+	previewVisible = false;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
-}
-
-function getPreviewHtml(plan: PlannedAction[]): string {
-const items = plan.map(action => {
-	switch (action.kind) {
-		case 'showTextDocument':
-			return '<li>Focus the active text document</li>';
-		case 'setSelections':
-			return '<li>Move cursor to requested selection(s)</li>';
-		case 'editInsert':
-			return `<li>Insert <code>${escapeHtml(action.text)}</code> at (${action.position[0]}, ${action.position[1]})</li>`;
-		case 'terminalShow':
-			return '<li>Focus the terminal</li>';
-		case 'terminalSendText':
-			return `<li>Run <code>${escapeHtml(action.text)}</code> in the terminal</li>`;
-		default:
-			return '';
-	}
-}).join('');
-return `<!DOCTYPE html>
-	<html>
-	<head>
-		<meta charset="UTF-8" />
-		<style>
-		body{font-family:var(--vscode-font-family);color:var(--vscode-foreground);background:var(--vscode-editor-background);margin:0}
-		.container{padding:12px}
-		h1{font-size:14px;margin:0 0 8px}
-		p{margin:0 0 8px}
-		ul{margin:0 0 8px 18px}
-		code{font-family:var(--vscode-editor-font-family);background:var(--vscode-editor-inactiveSelectionBackground);padding:1px 3px;border-radius:3px}
-		.hint{opacity:.8}
-		</style>
-	</head>
-	<body>
-		<div class="container">
-			<h1>Upcoming actions</h1>
-			<p>This step will perform the following changes:</p>
-			<ul>${items}</ul>
-			<p class="hint">Press <code>Tab</code> again to run, or <code>Esc</code> to hide.</p>
-		</div>
-	</body>
-	</html>`;
-}
-
-function escapeHtml(text: string): string {
-	return text
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;')
-		.replace(/\"/g, '&quot;')
-		.replace(/'/g, '&#39;');
 }

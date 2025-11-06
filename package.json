@@ -32,6 +32,12 @@
         "when": "editorTextFocus || terminalFocus"
       },
       {
+        "command": "crowd-pilot.testRun",
+        "key": "tab",
+        "mac": "tab",
+        "when": "inQuickOpen && crowdPilot.uiVisible"
+      },
+      {
         "command": "crowd-pilot.hideUi",
         "key": "escape",
         "mac": "escape",
