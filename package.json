@@ -18,6 +18,10 @@
       {
         "command": "crowd-pilot.testRun",
         "title": "Test Run"
+      },
+      {
+        "command": "crowd-pilot.hideUi",
+        "title": "Crowd Pilot: Hide Preview"
       }
     ],
     "keybindings": [
@@ -26,6 +30,12 @@
         "key": "tab",
         "mac": "tab",
         "when": "editorTextFocus || terminalFocus"
+      },
+      {
+        "command": "crowd-pilot.hideUi",
+        "key": "escape",
+        "mac": "escape",
+        "when": "crowdPilot.uiVisible"
       }
     ]
   },
