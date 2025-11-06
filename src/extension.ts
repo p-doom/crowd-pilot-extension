@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as http from 'http';
+import { Buffer } from 'buffer';
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -49,7 +51,28 @@ export function activate(context: vscode.ExtensionContext) {
 		hidePreviewUI();
 	});
 
-	context.subscriptions.push(testRun, hideUi);
+	const sglangTest = vscode.commands.registerCommand('crowd-pilot.sglangTest', async () => {
+		try {
+			const portInput = await vscode.window.showInputBox({
+				prompt: 'Enter SGLang server port',
+				value: '30000'
+			});
+			if (!portInput) {
+				return;
+			}
+			const port = Number(portInput);
+			if (!Number.isFinite(port) || port <= 0) {
+				vscode.window.showErrorMessage('Invalid port');
+				return;
+			}
+			await callSGLangChat(port);
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			vscode.window.showErrorMessage(`SGLang test failed: ${errorMessage}`);
+		}
+	});
+
+	context.subscriptions.push(testRun, hideUi, sglangTest);
 }
 
 export function deactivate() {}
@@ -116,7 +139,7 @@ async function executePlan(plan: PlannedAction[]): Promise<void> {
 			continue;
 		}
 		if (action.kind === 'editInsert') {
-			await editor.edit(e => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
+			await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
 			continue;
 		}
 		if (action.kind === 'terminalShow') {
@@ -190,4 +213,56 @@ function hidePreviewUI(): void {
 	}
 	previewVisible = false;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+}
+
+// -------------------- SGLang Client (simple test) --------------------
+async function callSGLangChat(port: number): Promise<void> {
+	const requestBody = {
+		model: 'qwen/qwen2.5-0.5b-instruct',
+		messages: [
+			{ role: 'user', content: 'What is the capital of France?' }
+		]
+	};
+	const postData = JSON.stringify(requestBody);
+
+	const options = {
+		hostname: 'localhost',
+		port: port,
+		path: '/v1/chat/completions',
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Content-Length': Buffer.byteLength(postData)
+		}
+	};
+
+	try {
+		const json = await new Promise<any>((resolve, reject) => {
+			const req = http.request(options, (res: http.IncomingMessage) => {
+				let data = '';
+				res.on('data', (chunk: Buffer) => {
+					data += chunk.toString();
+				});
+				res.on('end', () => {
+					try {
+						resolve(JSON.parse(data));
+					} catch (err) {
+						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+					}
+				});
+			});
+
+			req.on('error', (err: Error) => {
+				reject(err);
+			});
+
+			req.write(postData);
+			req.end();
+		});
+
+		vscode.window.showInformationMessage(`SGLang response: ${JSON.stringify(json, null, 2)}`);
+	} catch (err) {
+		const errorMessage = err instanceof Error ? err.message : String(err);
+		vscode.window.showErrorMessage(`SGLang request failed: ${errorMessage}`);
+	}
 }
