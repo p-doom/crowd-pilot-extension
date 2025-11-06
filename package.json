@@ -22,11 +22,11 @@
       },
       {
         "command": "crowd-pilot.hideUi",
-        "title": "Crowd Pilot: Hide Preview"
+        "title": "crowd-pilot: Hide Preview"
       },
       {
         "command": "crowd-pilot.sglangTest",
-        "title": "Crowd Pilot: Test SGLang"
+        "title": "crowd-pilot: Test SGLang"
       }
     ],
     "keybindings": [
