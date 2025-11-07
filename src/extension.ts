@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import { Buffer } from 'buffer';
 
+const HOSTNAME = 'hai005';
+const PORT = 30000;
+
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
@@ -11,8 +14,8 @@ export function activate(context: vscode.ExtensionContext) {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
 		const commandsToSkipShell = config.get<string[]>('commandsToSkipShell', []);
 		let updated = false;
-		if (!commandsToSkipShell.includes('crowd-pilot.testRun')) {
-			commandsToSkipShell.push('crowd-pilot.testRun');
+		if (!commandsToSkipShell.includes('crowd-pilot.modelRun')) {
+			commandsToSkipShell.push('crowd-pilot.modelRun');
 			updated = true;
 		}
 		if (!commandsToSkipShell.includes('crowd-pilot.hideUi')) {
@@ -26,27 +29,6 @@ export function activate(context: vscode.ExtensionContext) {
 		await primeTerminalSubsystem();
 	})().catch((err) => console.error('[crowd-pilot] Startup initialization error:', err));
 
-	const testRun = vscode.commands.registerCommand('crowd-pilot.testRun', async () => {
-		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			return;
-		}
-		const doc = editor.document;
-		const term = vscode.window.terminals[0] ?? vscode.window.createTerminal('Test');
-		const plan = buildTestRunPlan(editor, doc, term);
-
-		if (!previewVisible) {
-			showPreviewUI(plan);
-			return;
-		}
-
-		const runPlan = currentPlan ?? plan;
-		hidePreviewUI();
-
-		await executePlan(runPlan);
-		vscode.window.showInformationMessage('All actions emitted');
-	  });
-
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
 		hidePreviewUI();
 	});
@@ -57,20 +39,7 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		try {
-			const portInput = await vscode.window.showInputBox({
-				prompt: 'Enter SGLang server port',
-				value: '30000'
-			});
-			if (!portInput) {
-				return;
-			}
-			const port = Number(portInput);
-			if (!Number.isFinite(port) || port <= 0) {
-				vscode.window.showErrorMessage('Invalid port');
-				return;
-			}
-
-			const plan = await requestModelActions(port, editor);
+			const plan = await requestModelActions(editor);
 
 			if (!previewVisible) {
 				showPreviewUI(plan);
@@ -89,26 +58,14 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const sglangTest = vscode.commands.registerCommand('crowd-pilot.sglangTest', async () => {
 		try {
-			const portInput = await vscode.window.showInputBox({
-				prompt: 'Enter SGLang server port',
-				value: '30000'
-			});
-			if (!portInput) {
-				return;
-			}
-			const port = Number(portInput);
-			if (!Number.isFinite(port) || port <= 0) {
-				vscode.window.showErrorMessage('Invalid port');
-				return;
-			}
-			await callSGLangChat(port);
+			await callSGLangChat();
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			vscode.window.showErrorMessage(`SGLang test failed: ${errorMessage}`);
 		}
 	});
 
-	context.subscriptions.push(testRun, hideUi, sglangTest, modelRun);
+	context.subscriptions.push(hideUi, sglangTest, modelRun);
 }
 
 export function deactivate() {}
@@ -252,7 +209,7 @@ function hidePreviewUI(): void {
 }
 
 // -------------------- SGLang Client (simple test) --------------------
-async function callSGLangChat(port: number): Promise<void> {
+async function callSGLangChat(): Promise<void> {
 	const requestBody = {
 		model: 'qwen/qwen2.5-0.5b-instruct',
 		messages: [
@@ -262,8 +219,8 @@ async function callSGLangChat(port: number): Promise<void> {
 	const postData = JSON.stringify(requestBody);
 
 	const options = {
-		hostname: 'hai001',
-		port: port,
+		hostname: HOSTNAME,
+		port: PORT,
 		path: '/v1/chat/completions',
 		method: 'POST',
 		headers: {
@@ -304,7 +261,7 @@ async function callSGLangChat(port: number): Promise<void> {
 }
 
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(port: number, editor: vscode.TextEditor): Promise<PlannedAction[]> {
+async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction[]> {
 	const schemaDescription = [
 		'Output ONLY a JSON array. No prose, no code fences.',
 		'Allowed actions (TypeScript-like schema):',
@@ -335,8 +292,8 @@ async function requestModelActions(port: number, editor: vscode.TextEditor): Pro
 
 	const postData = JSON.stringify(requestBody);
 	const options = {
-		hostname: 'hai001',
-		port: port,
+		hostname: HOSTNAME,
+		port: PORT,
 		path: '/v1/chat/completions',
 		method: 'POST',
 		headers: {
