@@ -2,6 +2,7 @@
   "name": "crowd-pilot",
   "displayName": "crowd-pilot-extension",
   "description": "Teaching language models to code like humans.",
+  "publisher": "p(doom)",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.99.3"
@@ -21,7 +22,15 @@
       },
       {
         "command": "crowd-pilot.hideUi",
-        "title": "Crowd Pilot: Hide Preview"
+        "title": "crowd-pilot: Hide Preview"
+      },
+      {
+        "command": "crowd-pilot.sglangTest",
+        "title": "crowd-pilot: Test SGLang"
+      },
+      {
+        "command": "crowd-pilot.modelRun",
+        "title": "crowd-pilot: Model Plan & Run"
       }
     ],
     "keybindings": [

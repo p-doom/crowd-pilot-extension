@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as http from 'http';
+import { Buffer } from 'buffer';
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -49,7 +51,64 @@ export function activate(context: vscode.ExtensionContext) {
 		hidePreviewUI();
 	});
 
-	context.subscriptions.push(testRun, hideUi);
+	const modelRun = vscode.commands.registerCommand('crowd-pilot.modelRun', async () => {
+		const editor = vscode.window.activeTextEditor;
+		if (!editor) {
+			return;
+		}
+		try {
+			const portInput = await vscode.window.showInputBox({
+				prompt: 'Enter SGLang server port',
+				value: '30000'
+			});
+			if (!portInput) {
+				return;
+			}
+			const port = Number(portInput);
+			if (!Number.isFinite(port) || port <= 0) {
+				vscode.window.showErrorMessage('Invalid port');
+				return;
+			}
+
+			const plan = await requestModelActions(port, editor);
+
+			if (!previewVisible) {
+				showPreviewUI(plan);
+				return;
+			}
+
+			const runPlan = currentPlan ?? plan;
+			hidePreviewUI();
+			await executePlan(runPlan);
+			vscode.window.showInformationMessage('All actions emitted');
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			vscode.window.showErrorMessage(`Model run failed: ${errorMessage}`);
+		}
+	});
+
+	const sglangTest = vscode.commands.registerCommand('crowd-pilot.sglangTest', async () => {
+		try {
+			const portInput = await vscode.window.showInputBox({
+				prompt: 'Enter SGLang server port',
+				value: '30000'
+			});
+			if (!portInput) {
+				return;
+			}
+			const port = Number(portInput);
+			if (!Number.isFinite(port) || port <= 0) {
+				vscode.window.showErrorMessage('Invalid port');
+				return;
+			}
+			await callSGLangChat(port);
+		} catch (err) {
+			const errorMessage = err instanceof Error ? err.message : String(err);
+			vscode.window.showErrorMessage(`SGLang test failed: ${errorMessage}`);
+		}
+	});
+
+	context.subscriptions.push(testRun, hideUi, sglangTest, modelRun);
 }
 
 export function deactivate() {}
@@ -116,7 +175,7 @@ async function executePlan(plan: PlannedAction[]): Promise<void> {
 			continue;
 		}
 		if (action.kind === 'editInsert') {
-			await editor.edit(e => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
+			await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
 			continue;
 		}
 		if (action.kind === 'terminalShow') {
@@ -190,4 +249,192 @@ function hidePreviewUI(): void {
 	}
 	previewVisible = false;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+}
+
+// -------------------- SGLang Client (simple test) --------------------
+async function callSGLangChat(port: number): Promise<void> {
+	const requestBody = {
+		model: 'qwen/qwen2.5-0.5b-instruct',
+		messages: [
+			{ role: 'user', content: 'What is the capital of France?' }
+		]
+	};
+	const postData = JSON.stringify(requestBody);
+
+	const options = {
+		hostname: 'hai001',
+		port: port,
+		path: '/v1/chat/completions',
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Content-Length': Buffer.byteLength(postData)
+		}
+	};
+
+	try {
+		const json = await new Promise<any>((resolve, reject) => {
+			const req = http.request(options, (res: http.IncomingMessage) => {
+				let data = '';
+				res.on('data', (chunk: Buffer) => {
+					data += chunk.toString();
+				});
+				res.on('end', () => {
+					try {
+						resolve(JSON.parse(data));
+					} catch (err) {
+						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+					}
+				});
+			});
+
+			req.on('error', (err: Error) => {
+				reject(err);
+			});
+
+			req.write(postData);
+			req.end();
+		});
+
+		vscode.window.showInformationMessage(`SGLang response: ${JSON.stringify(json, null, 2)}`);
+	} catch (err) {
+		const errorMessage = err instanceof Error ? err.message : String(err);
+		vscode.window.showErrorMessage(`SGLang request failed: ${errorMessage}`);
+	}
+}
+
+// -------------------- Model-planned Actions --------------------
+async function requestModelActions(port: number, editor: vscode.TextEditor): Promise<PlannedAction[]> {
+	const schemaDescription = [
+		'Output ONLY a JSON array. No prose, no code fences.',
+		'Allowed actions (TypeScript-like schema):',
+		"{ kind: 'showTextDocument' }",
+		"{ kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }",
+		"{ kind: 'editInsert', position: [number, number], text: string }",
+		"{ kind: 'terminalShow' }",
+		"{ kind: 'terminalSendText', text: string }",
+		'Coordinates are zero-based [line, column].'
+	].join('\n');
+
+	const demoGoal = [
+		'Create a concise demo plan that:',
+		'- focuses the active text document',
+		'- moves the cursor to (0, 0)',
+		"- inserts the line \"hello from model\\n\" at (0, 0)",
+		'- focuses the terminal',
+		'- runs the command "echo model run"'
+	].join('\n');
+
+	const requestBody = {
+		model: 'qwen/qwen2.5-0.5b-instruct',
+		messages: [
+			{ role: 'system', content: schemaDescription },
+			{ role: 'user', content: demoGoal }
+		]
+	};
+
+	const postData = JSON.stringify(requestBody);
+	const options = {
+		hostname: 'hai001',
+		port: port,
+		path: '/v1/chat/completions',
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'Content-Length': Buffer.byteLength(postData)
+		}
+	};
+
+	const json = await new Promise<any>((resolve, reject) => {
+		const req = http.request(options, (res: http.IncomingMessage) => {
+			let data = '';
+			res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
+			res.on('end', () => {
+				try {
+					resolve(JSON.parse(data));
+				} catch (err) {
+					reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+				}
+			});
+		});
+		req.on('error', (err: Error) => reject(err));
+		req.write(postData);
+		req.end();
+	});
+
+	const content = extractChatContent(json);
+	if (typeof content !== 'string' || content.trim().length === 0) {
+		throw new Error('Empty model content');
+	}
+	const actions = parsePlannedActions(content);
+	if (actions.length === 0) {
+		throw new Error('No valid actions parsed from model output');
+	}
+	return actions;
+}
+
+function extractChatContent(json: any): string | undefined {
+	try {
+		if (json && Array.isArray(json.choices) && json.choices[0]) {
+			const choice = json.choices[0];
+			if (choice.message && typeof choice.message.content === 'string') {
+				return choice.message.content;
+			}
+			if (typeof choice.text === 'string') {
+				return choice.text;
+			}
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function parsePlannedActions(raw: string): PlannedAction[] {
+	let text = raw.trim();
+	text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+	const arrayMatch = text.match(/\[[\s\S]*\]/);
+	const jsonText = arrayMatch ? arrayMatch[0] : text;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(jsonText);
+	} catch (err) {
+		return [];
+	}
+	if (!Array.isArray(parsed)) { return []; }
+	const result: PlannedAction[] = [];
+	for (const item of parsed) {
+		if (!item || typeof item !== 'object' || typeof (item as any).kind !== 'string') { continue; }
+		switch ((item as any).kind) {
+			case 'showTextDocument':
+				result.push({ kind: 'showTextDocument' });
+				break;
+			case 'setSelections': {
+				const selections = Array.isArray((item as any).selections) ? (item as any).selections : [];
+				const norm = selections.map((s: any) => ({
+					start: Array.isArray(s?.start) && s.start.length === 2 ? [Number(s.start[0]) || 0, Number(s.start[1]) || 0] as [number, number] : [0, 0] as [number, number],
+					end: Array.isArray(s?.end) && s.end.length === 2 ? [Number(s.end[0]) || 0, Number(s.end[1]) || 0] as [number, number] : [0, 0] as [number, number]
+				}));
+				result.push({ kind: 'setSelections', selections: norm });
+				break;
+			}
+			case 'editInsert': {
+				const pos = Array.isArray((item as any).position) && (item as any).position.length === 2 ? [Number((item as any).position[0]) || 0, Number((item as any).position[1]) || 0] as [number, number] : [0, 0] as [number, number];
+				const text = typeof (item as any).text === 'string' ? (item as any).text : '';
+				result.push({ kind: 'editInsert', position: pos, text });
+				break;
+			}
+			case 'terminalShow':
+				result.push({ kind: 'terminalShow' });
+				break;
+			case 'terminalSendText': {
+				const text = typeof (item as any).text === 'string' ? (item as any).text : '';
+				result.push({ kind: 'terminalSendText', text });
+				break;
+			}
+			default:
+				break;
+		}
+	}
+	return result;
 }
