@@ -27,6 +27,10 @@
       {
         "command": "crowd-pilot.sglangTest",
         "title": "crowd-pilot: Test SGLang"
+      },
+      {
+        "command": "crowd-pilot.modelRun",
+        "title": "crowd-pilot: Model Plan & Run"
       }
     ],
     "keybindings": [
