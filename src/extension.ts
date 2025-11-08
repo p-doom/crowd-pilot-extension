@@ -78,16 +78,6 @@ type PlannedAction =
 
 let currentPlan: PlannedAction[] | undefined;
 
-function buildTestRunPlan(_editor: vscode.TextEditor, _doc: vscode.TextDocument, _term: vscode.Terminal): PlannedAction[] {
-	const plan: PlannedAction[] = [];
-	plan.push({ kind: 'showTextDocument' });
-	plan.push({ kind: 'setSelections', selections: [{ start: [0, 0], end: [0, 0] }] });
-	plan.push({ kind: 'editInsert', position: [0, 0], text: 'hello world\n' });
-	plan.push({ kind: 'terminalShow' });
-	plan.push({ kind: 'terminalSendText', text: 'echo VSCode test' });
-	return plan;
-}
-
 async function executePlan(plan: PlannedAction[]): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
@@ -247,8 +237,8 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 		'{ kind: "terminalShow" }',
 		'{ kind: "terminalSendText", text: string }',
 		'Guidelines:',
-		'- Prefer small and safe steps.',
-		'- If uncertain, set a helpful cursor/selection.',
+		'- If you you insert text, insert until the logical end of the current statement or block.',
+		'- When inserting text, make sure to not repeat existing text (except when replacing existing text).',
 		'- Use double-quoted JSON strings.'
 	].join('\n');
 
