@@ -25,8 +25,6 @@ export function activate(context: vscode.ExtensionContext) {
 		if (updated) {
 			await config.update('commandsToSkipShell', commandsToSkipShell, vscode.ConfigurationTarget.Global);
 		}
-		// Prime terminal subsystem after intercept is enabled (NOTE: this is a workaround)
-		await primeTerminalSubsystem();
 	})().catch((err) => console.error('[crowd-pilot] Startup initialization error:', err));
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
@@ -69,30 +67,6 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
-
-async function primeTerminalSubsystem(): Promise<void> {
-	try {
-		if (vscode.window.terminals.length > 0) {
-			return;
-		}
-		const opened = new Promise<void>((resolve) => {
-			const d = vscode.window.onDidOpenTerminal(() => {
-				try { d.dispose(); } catch {}
-				resolve();
-			});
-		});
-		const t = vscode.window.createTerminal('crowd-pilot prime');
-		await Promise.race([
-			opened,
-			new Promise<void>(r => setTimeout(r, 150))
-		]);
-		try { t.dispose(); } catch {}
-		await new Promise<void>(r => setTimeout(r, 50));
-		console.log('[crowd-pilot] Primed terminal subsystem');
-	} catch (err) {
-		console.error('[crowd-pilot] Failed to prime terminal subsystem:', err);
-	}
-}
 
 // -------------------- Plan Types & Execution --------------------
 type PlannedAction =
