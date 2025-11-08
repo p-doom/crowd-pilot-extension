@@ -2,6 +2,9 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import { Buffer } from 'buffer';
 
+const HOSTNAME = 'hai005';
+const PORT = 30000;
+
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
@@ -11,8 +14,8 @@ export function activate(context: vscode.ExtensionContext) {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
 		const commandsToSkipShell = config.get<string[]>('commandsToSkipShell', []);
 		let updated = false;
-		if (!commandsToSkipShell.includes('crowd-pilot.testRun')) {
-			commandsToSkipShell.push('crowd-pilot.testRun');
+		if (!commandsToSkipShell.includes('crowd-pilot.modelRun')) {
+			commandsToSkipShell.push('crowd-pilot.modelRun');
 			updated = true;
 		}
 		if (!commandsToSkipShell.includes('crowd-pilot.hideUi')) {
@@ -22,30 +25,7 @@ export function activate(context: vscode.ExtensionContext) {
 		if (updated) {
 			await config.update('commandsToSkipShell', commandsToSkipShell, vscode.ConfigurationTarget.Global);
 		}
-		// Prime terminal subsystem after intercept is enabled (NOTE: this is a workaround)
-		await primeTerminalSubsystem();
 	})().catch((err) => console.error('[crowd-pilot] Startup initialization error:', err));
-
-	const testRun = vscode.commands.registerCommand('crowd-pilot.testRun', async () => {
-		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			return;
-		}
-		const doc = editor.document;
-		const term = vscode.window.terminals[0] ?? vscode.window.createTerminal('Test');
-		const plan = buildTestRunPlan(editor, doc, term);
-
-		if (!previewVisible) {
-			showPreviewUI(plan);
-			return;
-		}
-
-		const runPlan = currentPlan ?? plan;
-		hidePreviewUI();
-
-		await executePlan(runPlan);
-		vscode.window.showInformationMessage('All actions emitted');
-	  });
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
 		hidePreviewUI();
@@ -57,20 +37,7 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		try {
-			const portInput = await vscode.window.showInputBox({
-				prompt: 'Enter SGLang server port',
-				value: '30000'
-			});
-			if (!portInput) {
-				return;
-			}
-			const port = Number(portInput);
-			if (!Number.isFinite(port) || port <= 0) {
-				vscode.window.showErrorMessage('Invalid port');
-				return;
-			}
-
-			const plan = await requestModelActions(port, editor);
+			const plan = await requestModelActions(editor);
 
 			if (!previewVisible) {
 				showPreviewUI(plan);
@@ -89,53 +56,17 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const sglangTest = vscode.commands.registerCommand('crowd-pilot.sglangTest', async () => {
 		try {
-			const portInput = await vscode.window.showInputBox({
-				prompt: 'Enter SGLang server port',
-				value: '30000'
-			});
-			if (!portInput) {
-				return;
-			}
-			const port = Number(portInput);
-			if (!Number.isFinite(port) || port <= 0) {
-				vscode.window.showErrorMessage('Invalid port');
-				return;
-			}
-			await callSGLangChat(port);
+			await callSGLangChat();
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			vscode.window.showErrorMessage(`SGLang test failed: ${errorMessage}`);
 		}
 	});
 
-	context.subscriptions.push(testRun, hideUi, sglangTest, modelRun);
+	context.subscriptions.push(hideUi, sglangTest, modelRun);
 }
 
 export function deactivate() {}
-
-async function primeTerminalSubsystem(): Promise<void> {
-	try {
-		if (vscode.window.terminals.length > 0) {
-			return;
-		}
-		const opened = new Promise<void>((resolve) => {
-			const d = vscode.window.onDidOpenTerminal(() => {
-				try { d.dispose(); } catch {}
-				resolve();
-			});
-		});
-		const t = vscode.window.createTerminal('crowd-pilot prime');
-		await Promise.race([
-			opened,
-			new Promise<void>(r => setTimeout(r, 150))
-		]);
-		try { t.dispose(); } catch {}
-		await new Promise<void>(r => setTimeout(r, 50));
-		console.log('[crowd-pilot] Primed terminal subsystem');
-	} catch (err) {
-		console.error('[crowd-pilot] Failed to prime terminal subsystem:', err);
-	}
-}
 
 // -------------------- Plan Types & Execution --------------------
 type PlannedAction =
@@ -146,16 +77,6 @@ type PlannedAction =
 | { kind: 'terminalSendText', text: string };
 
 let currentPlan: PlannedAction[] | undefined;
-
-function buildTestRunPlan(_editor: vscode.TextEditor, _doc: vscode.TextDocument, _term: vscode.Terminal): PlannedAction[] {
-	const plan: PlannedAction[] = [];
-	plan.push({ kind: 'showTextDocument' });
-	plan.push({ kind: 'setSelections', selections: [{ start: [0, 0], end: [0, 0] }] });
-	plan.push({ kind: 'editInsert', position: [0, 0], text: 'hello world\n' });
-	plan.push({ kind: 'terminalShow' });
-	plan.push({ kind: 'terminalSendText', text: 'echo VSCode test' });
-	return plan;
-}
 
 async function executePlan(plan: PlannedAction[]): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
@@ -252,7 +173,7 @@ function hidePreviewUI(): void {
 }
 
 // -------------------- SGLang Client (simple test) --------------------
-async function callSGLangChat(port: number): Promise<void> {
+async function callSGLangChat(): Promise<void> {
 	const requestBody = {
 		model: 'qwen/qwen2.5-0.5b-instruct',
 		messages: [
@@ -262,8 +183,8 @@ async function callSGLangChat(port: number): Promise<void> {
 	const postData = JSON.stringify(requestBody);
 
 	const options = {
-		hostname: 'hai001',
-		port: port,
+		hostname: HOSTNAME,
+		port: PORT,
 		path: '/v1/chat/completions',
 		method: 'POST',
 		headers: {
@@ -304,39 +225,71 @@ async function callSGLangChat(port: number): Promise<void> {
 }
 
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(port: number, editor: vscode.TextEditor): Promise<PlannedAction[]> {
+async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction[]> {
 	const schemaDescription = [
-		'Output ONLY a JSON array. No prose, no code fences.',
-		'Allowed actions (TypeScript-like schema):',
-		"{ kind: 'showTextDocument' }",
-		"{ kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }",
-		"{ kind: 'editInsert', position: [number, number], text: string }",
-		"{ kind: 'terminalShow' }",
-		"{ kind: 'terminalSendText', text: string }",
-		'Coordinates are zero-based [line, column].'
+		'Role: You suggest the next VS Code editor/terminal action to progress the current task.',
+		'Output ONLY a JSON array (no prose, no code fences). Length exactly 1.',
+		'Coordinates are zero-based [line, column].',
+		'Allowed actions (JSON schema-like):',
+		'{ kind: "showTextDocument" }',
+		'{ kind: "setSelections", selections: Array<{ start: [number, number], end: [number, number] }> }',
+		'{ kind: "editInsert", position: [number, number], text: string }',
+		'{ kind: "terminalShow" }',
+		'{ kind: "terminalSendText", text: string }',
+		'Guidelines:',
+		'- If you you insert text, insert until the logical end of the current statement or block.',
+		'- When inserting text, make sure to not repeat existing text (except when replacing existing text).',
+		'- Use double-quoted JSON strings.'
 	].join('\n');
 
-	const demoGoal = [
-		'Create a concise demo plan that:',
-		'- focuses the active text document',
-		'- moves the cursor to (0, 0)',
-		"- inserts the line \"hello from model\\n\" at (0, 0)",
-		'- focuses the terminal',
-		'- runs the command "echo model run"'
+	const doc = editor.document;
+	const cursor = editor.selection.active;
+	const contextRange = new vscode.Range(new vscode.Position(0, 0), cursor);
+	const contextCode = doc.getText(contextRange);
+	const maxContextChars = 20000;
+	const allLines = contextCode.split(/\r?\n/);
+	let startLineIndex = 0;
+	let visibleLines = allLines;
+	if (contextCode.length > maxContextChars) {
+		let acc = 0;
+		let idx = allLines.length;
+		while (idx > 0 && acc <= maxContextChars) {
+			idx--;
+			acc += allLines[idx].length + 1;
+		}
+		startLineIndex = idx;
+		visibleLines = allLines.slice(idx);
+	}
+	const numberedContext = visibleLines.map((line, i) => `${startLineIndex + i}: ${line}`).join('\n');
+
+	const tabbingPrompt = [
+		'Your role: Propose the single next action according to the schema to help the developer progress.',
+		'',
+		'Available context:',
+		`- File: ${doc.fileName}`,
+		`- Language: ${doc.languageId}`,
+		`- Cursor: (${cursor.line}, ${cursor.character})`,
+		'',
+		'Current file content up to the cursor (zero-based line numbers):',
+		'```',
+		numberedContext,
+		'```',
+		'',
+		'Respond with ONLY a JSON array containing exactly one action.'
 	].join('\n');
 
 	const requestBody = {
 		model: 'qwen/qwen2.5-0.5b-instruct',
 		messages: [
 			{ role: 'system', content: schemaDescription },
-			{ role: 'user', content: demoGoal }
+			{ role: 'user', content: tabbingPrompt }
 		]
 	};
 
 	const postData = JSON.stringify(requestBody);
 	const options = {
-		hostname: 'hai001',
-		port: port,
+		hostname: HOSTNAME,
+		port: PORT,
 		path: '/v1/chat/completions',
 		method: 'POST',
 		headers: {

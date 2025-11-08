@@ -35,13 +35,13 @@
     ],
     "keybindings": [
       {
-        "command": "crowd-pilot.testRun",
+        "command": "crowd-pilot.modelRun",
         "key": "tab",
         "mac": "tab",
         "when": "editorTextFocus || terminalFocus"
       },
       {
-        "command": "crowd-pilot.testRun",
+        "command": "crowd-pilot.modelRun",
         "key": "tab",
         "mac": "tab",
         "when": "inQuickOpen && crowdPilot.uiVisible"
