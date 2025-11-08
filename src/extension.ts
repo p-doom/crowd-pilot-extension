@@ -237,30 +237,62 @@ async function callSGLangChat(): Promise<void> {
 // -------------------- Model-planned Actions --------------------
 async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction[]> {
 	const schemaDescription = [
-		'Output ONLY a JSON array. No prose, no code fences.',
-		'Allowed actions (TypeScript-like schema):',
-		"{ kind: 'showTextDocument' }",
-		"{ kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }",
-		"{ kind: 'editInsert', position: [number, number], text: string }",
-		"{ kind: 'terminalShow' }",
-		"{ kind: 'terminalSendText', text: string }",
-		'Coordinates are zero-based [line, column].'
+		'Role: You suggest the next VS Code editor/terminal action to progress the current task.',
+		'Output ONLY a JSON array (no prose, no code fences). Length exactly 1.',
+		'Coordinates are zero-based [line, column].',
+		'Allowed actions (JSON schema-like):',
+		'{ kind: "showTextDocument" }',
+		'{ kind: "setSelections", selections: Array<{ start: [number, number], end: [number, number] }> }',
+		'{ kind: "editInsert", position: [number, number], text: string }',
+		'{ kind: "terminalShow" }',
+		'{ kind: "terminalSendText", text: string }',
+		'Guidelines:',
+		'- Prefer small and safe steps.',
+		'- If uncertain, set a helpful cursor/selection.',
+		'- Use double-quoted JSON strings.'
 	].join('\n');
 
-	const demoGoal = [
-		'Create a concise demo plan that:',
-		'- focuses the active text document',
-		'- moves the cursor to (0, 0)',
-		"- inserts the line \"hello from model\\n\" at (0, 0)",
-		'- focuses the terminal',
-		'- runs the command "echo model run"'
+	const doc = editor.document;
+	const cursor = editor.selection.active;
+	const contextRange = new vscode.Range(new vscode.Position(0, 0), cursor);
+	const contextCode = doc.getText(contextRange);
+	const maxContextChars = 20000;
+	const allLines = contextCode.split(/\r?\n/);
+	let startLineIndex = 0;
+	let visibleLines = allLines;
+	if (contextCode.length > maxContextChars) {
+		let acc = 0;
+		let idx = allLines.length;
+		while (idx > 0 && acc <= maxContextChars) {
+			idx--;
+			acc += allLines[idx].length + 1;
+		}
+		startLineIndex = idx;
+		visibleLines = allLines.slice(idx);
+	}
+	const numberedContext = visibleLines.map((line, i) => `${startLineIndex + i}: ${line}`).join('\n');
+
+	const tabbingPrompt = [
+		'Your role: Propose the single next action according to the schema to help the developer progress.',
+		'',
+		'Available context:',
+		`- File: ${doc.fileName}`,
+		`- Language: ${doc.languageId}`,
+		`- Cursor: (${cursor.line}, ${cursor.character})`,
+		'',
+		'Current file content up to the cursor (zero-based line numbers):',
+		'```',
+		numberedContext,
+		'```',
+		'',
+		'Respond with ONLY a JSON array containing exactly one action.'
 	].join('\n');
 
 	const requestBody = {
 		model: 'qwen/qwen2.5-0.5b-instruct',
 		messages: [
 			{ role: 'system', content: schemaDescription },
-			{ role: 'user', content: demoGoal }
+			{ role: 'user', content: tabbingPrompt }
 		]
 	};
 
