@@ -254,9 +254,15 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		editor.setDecorations(decorationReplaceType, [{ range }]);
 
 		// Show replacement block on the line after the replaced range
-		const lines = next.text.split(/\r?\n/);
-		const oneLineBlock = next.text.replace(/\r?\n/g, ' ⏎ ');
+		const fullBlock = next.text;
 		
+		// CSS-escape the text for the 'content' property:
+		// - Escape double quotes
+		// - Replace newlines with \A (CSS newline)
+		const cssContent = fullBlock
+			.replace(/"/g, '\\"')
+			.replace(/\r?\n/g, '\\A '); 
+
 		// Determine target for the "lines after" decoration
 		const docLineCount = editor.document.lineCount;
 		const endLine = range.end.line;
@@ -266,13 +272,13 @@ function showPreviewUI(plan: PlannedAction[]): void {
 			const nextLineStart = new vscode.Position(endLine + 1, 0);
 			decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 				before: {
-					contentText: `↳ [Replacement]: ${oneLineBlock}`,
+					contentText: '', // Handled by CSS content
 					color: new vscode.ThemeColor('charts.purple'),
+					backgroundColor: new vscode.ThemeColor('editor.background'),
 					fontStyle: 'italic',
 					fontWeight: '600',
-					backgroundColor: 'rgba(100, 0, 100, 0.15)',
 					margin: '0 0 0 20px',
-					textDecoration: 'none; display: block;' // Attempt to force block display
+					textDecoration: `none; display: block; white-space: pre; content: "↳ [Replacement]:\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
 				}
 			});
 			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(nextLineStart, nextLineStart) }]);
@@ -280,12 +286,13 @@ function showPreviewUI(plan: PlannedAction[]): void {
 			// EOF: Attach 'after' decoration to the end of the current line
 			decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 				after: {
-					contentText: `  ↳ [Replacement]: ${oneLineBlock}`,
+					contentText: '', // Handled by CSS content
 					color: new vscode.ThemeColor('charts.purple'),
+					backgroundColor: new vscode.ThemeColor('editor.background'),
 					fontStyle: 'italic',
 					fontWeight: '600',
-					backgroundColor: 'rgba(100, 0, 100, 0.15)',
-					margin: '0 0 0 20px'
+					margin: '0 0 0 20px',
+					textDecoration: `none; display: block; white-space: pre; content: "\\A   ↳ [Replacement]:\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
 				}
 			});
 			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(range.end, range.end) }]);
