@@ -225,7 +225,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 					fontStyle: 'italic',
 					fontWeight: '600',
 					margin: '0',
-					textDecoration: `none; display: block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+					textDecoration: `none; display: block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
 				}
 			});
 			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
@@ -236,39 +236,18 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				.replace(/"/g, '\\"')
 				.replace(/\r?\n/g, '\\A ');
 	
-			const docLineCount = editor.document.lineCount;
-			const endLine = pos.line;
-	
-			if (endLine + 1 < docLineCount) {
-				const nextLineStart = new vscode.Position(endLine + 1, 0);
-				decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-					before: {
-						contentText: '',
-						color: new vscode.ThemeColor('charts.purple'),
-						backgroundColor: new vscode.ThemeColor('editor.background'),
-						fontStyle: 'italic',
-						fontWeight: '600',
-						margin: '0',
-						// Add border-top to visualize the insertion point
-						textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
-					}
-				});
-				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(nextLineStart, nextLineStart) }]);
-			} else {
-				decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-					after: {
-						contentText: '',
-						color: new vscode.ThemeColor('charts.purple'),
-						backgroundColor: new vscode.ThemeColor('editor.background'),
-						fontStyle: 'italic',
-						fontWeight: '600',
-						margin: '0',
-						// Add border-top to visualize the insertion point
-						textDecoration: `none; display: block; white-space: pre; content: "\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
-					}
-				});
-				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(pos, pos) }]);
-			}
+			decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+				before: {
+					contentText: '',
+					color: new vscode.ThemeColor('charts.purple'),
+					backgroundColor: new vscode.ThemeColor('editor.background'),
+					fontStyle: 'italic',
+					fontWeight: '600',
+					margin: '0',
+					textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
+				}
+			});
+			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(pos, pos) }]);
 		} else if (next.kind === 'editDelete') {
 			const range = new vscode.Range(
 				new vscode.Position(next.range.start[0], next.range.start[1]),
@@ -319,7 +298,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 						fontStyle: 'italic',
 						fontWeight: '600',
 						margin: '0',
-						textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+						textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
 					}
 				});
 				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(nextLineStart, nextLineStart) }]);
@@ -333,7 +312,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 						fontStyle: 'italic',
 						fontWeight: '600',
 						margin: '0',
-						textDecoration: `none; display: block; white-space: pre; content: "\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+						textDecoration: `none; display: block; white-space: pre; content: "\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
 					}
 				});
 				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(range.end, range.end) }]);
@@ -390,10 +369,20 @@ function getHardcodedNextAction(editor: vscode.TextEditor): PlannedAction | unde
 	if (mockStep === 2) {
 		const startLine = clamp(cursor.line + 6, 0, Math.max(0, lineCount - 1));
 		const endLine = clamp(startLine + 2, 0, Math.max(0, lineCount - 1));
-		const endChar = doc.lineAt(endLine).range.end.character;
+		
+		// To fully delete the lines including the newline, we target the start of the next line.
+		let endPosLine = endLine + 1;
+		let endPosChar = 0;
+		
+		if (endPosLine >= lineCount) {
+			// If deleting the last line(s), just go to the end of the document
+			endPosLine = lineCount - 1;
+			endPosChar = doc.lineAt(endPosLine).range.end.character;
+		}
+
 		const range = {
 			start: [startLine, 0] as [number, number],
-			end: [endLine, endChar] as [number, number]
+			end: [endPosLine, endPosChar] as [number, number]
 		};
 		return { kind: 'editDelete', range };
 	}
