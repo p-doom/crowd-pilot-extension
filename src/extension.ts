@@ -278,7 +278,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 					fontStyle: 'italic',
 					fontWeight: '600',
 					margin: '0 0 0 20px',
-					textDecoration: `none; display: block; white-space: pre; content: "↳ [Replacement]:\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+					textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
 				}
 			});
 			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(nextLineStart, nextLineStart) }]);
@@ -292,7 +292,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 					fontStyle: 'italic',
 					fontWeight: '600',
 					margin: '0 0 0 20px',
-					textDecoration: `none; display: block; white-space: pre; content: "\\A   ↳ [Replacement]:\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+					textDecoration: `none; display: block; white-space: pre; content: "\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
 				}
 			});
 			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(range.end, range.end) }]);
