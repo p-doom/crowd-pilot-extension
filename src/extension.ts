@@ -203,8 +203,8 @@ function showPreviewUI(plan: PlannedAction[]): void {
 	if (!editor) { return; }
 	disposePreviewDecorations();
 
-	// Only preview the next text edit action (insert/delete/replace/terminalShow)
-	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalShow');
+	// Only preview the next text edit action (insert/delete/replace/terminalShow/terminalSendText)
+	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalShow' || a.kind === 'terminalSendText');
 	if (!next) {
 		previewVisible = false;
 		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
@@ -228,6 +228,21 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				fontWeight: '600',
 				margin: '0 0 0 20px',
 				textDecoration: `none; display: block; white-space: pre; content: "↳ Focus Terminal"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+			}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
+	} else if (next.kind === 'terminalSendText') {
+		const cursor = editor.selection.active;
+		const cmd = next.text.replace(/"/g, '\\"').replace(/\r?\n/g, '\\A ');
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '',
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: '0 0 0 20px',
+				textDecoration: `none; display: block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
 			}
 		});
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
@@ -374,11 +389,15 @@ function getHardcodedNextAction(editor: vscode.TextEditor): PlannedAction | unde
 	if (mockStep === 3) {
 		return { kind: 'terminalShow' };
 	}
+	// Step 4: Execute in Terminal
+	if (mockStep === 4) {
+		return { kind: 'terminalSendText', text: 'echo "Hello World"' };
+	}
 	return undefined;
 }
 
 function advanceMockStep(): void {
-	mockStep = (mockStep + 1) % 4;
+	mockStep = (mockStep + 1) % 5;
 }
 
 function autoShowNextAction(): void {
