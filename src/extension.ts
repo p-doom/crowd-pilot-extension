@@ -203,8 +203,8 @@ function showPreviewUI(plan: PlannedAction[]): void {
 	if (!editor) { return; }
 	disposePreviewDecorations();
 
-	// Only preview the next text edit action (insert/delete/replace)
-	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace');
+	// Only preview the next text edit action (insert/delete/replace/terminalShow)
+	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalShow');
 	if (!next) {
 		previewVisible = false;
 		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
@@ -217,7 +217,21 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		return oneLine.length > 80 ? oneLine.slice(0, 77) + '…' : oneLine;
 	};
 
-	if (next.kind === 'editInsert') {
+	if (next.kind === 'terminalShow') {
+		const cursor = editor.selection.active;
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '',
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: '0 0 0 20px',
+				textDecoration: `none; display: block; white-space: pre; content: "↳ Focus Terminal"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none;`
+			}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
+	} else if (next.kind === 'editInsert') {
 		const pos = new vscode.Position(next.position[0], next.position[1]);
 		decorationInsertType = vscode.window.createTextEditorDecorationType({
 			after: {
@@ -356,11 +370,15 @@ function getHardcodedNextAction(editor: vscode.TextEditor): PlannedAction | unde
 		};
 		return { kind: 'editDelete', range };
 	}
+	// Step 3: Focus Terminal
+	if (mockStep === 3) {
+		return { kind: 'terminalShow' };
+	}
 	return undefined;
 }
 
 function advanceMockStep(): void {
-	mockStep = (mockStep + 1) % 3;
+	mockStep = (mockStep + 1) % 4;
 }
 
 function autoShowNextAction(): void {
