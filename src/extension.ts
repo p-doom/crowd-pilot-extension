@@ -200,8 +200,8 @@ function showPreviewUI(plan: PlannedAction[]): void {
 	if (!editor) { return; }
 	disposePreviewDecorations();
 
-	// Only preview the next text edit action (insert/delete/replace/terminalSendText)
-	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalSendText');
+	// Only preview the next text edit action (insert/delete/replace/terminalSendText/setSelections)
+	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalSendText' || a.kind === 'setSelections');
 	if (!next) {
 		previewVisible = false;
 		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
@@ -214,7 +214,26 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		return oneLine.length > 80 ? oneLine.slice(0, 77) + '…' : oneLine;
 	};
 
-	if (next.kind === 'terminalSendText') {
+	if (next.kind === 'setSelections') {
+		// For setSelections, we only preview the primary selection's start/active position
+		const selection = next.selections[0];
+		const targetPos = new vscode.Position(selection.start[0], selection.start[1]);
+		
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '',
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: '0',
+				textDecoration: `none; display: block; white-space: pre; content: "↳ Move Cursor Here"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
+			}
+		});
+		// If target is EOF/empty line, we might need 'after' or 'before'.
+		// 'after' on the target position usually works if line exists.
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(targetPos, targetPos) }]);
+	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
 		const cmd = next.text.replace(/"/g, '\\"').replace(/\r?\n/g, '\\A ');
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
@@ -390,11 +409,20 @@ function getHardcodedNextAction(editor: vscode.TextEditor): PlannedAction | unde
 	if (mockStep === 3) {
 		return { kind: 'terminalSendText', text: 'echo "Hello World"' };
 	}
+	// Step 4: Move Cursor to End of File
+	if (mockStep === 4) {
+		const lastLine = doc.lineCount - 1;
+		const lastChar = doc.lineAt(lastLine).range.end.character;
+		return {
+			kind: 'setSelections',
+			selections: [{ start: [lastLine, lastChar], end: [lastLine, lastChar] }]
+		};
+	}
 	return undefined;
 }
 
 function advanceMockStep(): void {
-	mockStep = (mockStep + 1) % 4;
+	mockStep = (mockStep + 1) % 5;
 }
 
 function autoShowNextAction(): void {
