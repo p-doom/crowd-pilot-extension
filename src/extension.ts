@@ -144,6 +144,9 @@ async function executePlan(plan: PlannedAction[]): Promise<void> {
 				new vscode.Position(s.start[0], s.start[1]),
 				new vscode.Position(s.end[0], s.end[1])
 			));
+			if (editor.selections.length > 0) {
+				editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+			}
 			continue;
 		}
 		if (action.kind === 'editInsert') {
@@ -261,7 +264,30 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		// For setSelections, we only preview the primary selection's start/active position
 		const selection = next.selections[0];
 		const targetPos = new vscode.Position(selection.start[0], selection.start[1]);
-		const margin = getDynamicMargin(editor, targetPos.line, "↳ Move Cursor Here");
+		// Check if the target position is visible
+		const isVisible = editor.visibleRanges.some(r => r.contains(targetPos));
+		
+		let anchorPos = targetPos;
+		let label = "↳ Move Cursor Here";
+
+		if (!isVisible && editor.visibleRanges.length > 0) {
+			const firstVisible = editor.visibleRanges[0].start;
+			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
+			
+			if (targetPos.isBefore(firstVisible)) {
+				anchorPos = editor.document.lineAt(firstVisible.line).range.end;
+			} else {
+				anchorPos = editor.document.lineAt(lastVisible.line).range.end;
+			}
+
+			if (targetPos.line < anchorPos.line) {
+				label = `↑ Move Cursor to Line ${targetPos.line + 1}`;
+			} else {
+				label = `↓ Move Cursor to Line ${targetPos.line + 1}`;
+			}
+		}
+
+		const margin = getDynamicMargin(editor, anchorPos.line, label);
 
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
@@ -271,10 +297,10 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				fontStyle: 'italic',
 				fontWeight: '600',
 				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "↳ Move Cursor Here"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${label}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(targetPos, targetPos) }]);
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
 	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
 		const lineEnd = editor.document.lineAt(cursor.line).range.end;
