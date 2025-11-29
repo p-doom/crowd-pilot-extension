@@ -277,6 +277,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(targetPos, targetPos) }]);
 	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
+		const lineEnd = editor.document.lineAt(cursor.line).range.end;
 		const cmd = next.text.replace(/"/g, '\\"').replace(/\r?\n/g, '\\A ');
 		const margin = getDynamicMargin(editor, cursor.line, "↳ Execute in Terminal:\n" + next.text);
 
@@ -291,7 +292,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				textDecoration: `none; display: inline-block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(lineEnd, lineEnd) }]);
 	} else if (next.kind === 'editInsert') {
 		const posLine = next.position[0];
 		const fullBlock = next.text;
@@ -299,14 +300,39 @@ function showPreviewUI(plan: PlannedAction[]): void {
 			.replace(/"/g, '\\"')
 			.replace(/\r?\n/g, '\\A ');
 
-		// "Next to" logic:
-		// If inserting at line N > 0, we attach 'after' to line N-1.
-		// If inserting at line 0, we attach 'after' to line 0 (best effort).
-		const anchorLine = posLine > 0 ? posLine - 1 : 0;
-		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE); // End of anchor line
-		const margin = getDynamicMargin(editor, anchorLine, fullBlock);
+		const docLineCount = editor.document.lineCount;
+		// If inserting at EOF (or beyond), attach to the last line.
+		// Otherwise, attach to the line AT the insertion point and shift visually UP into the gap.
+		let anchorLine = posLine;
+		let shiftUp = true;
+		
+		if (anchorLine >= docLineCount) {
+			anchorLine = docLineCount - 1;
+			shiftUp = false; // At EOF, we just append below or to the right
+		}
+
+		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE); 
+		
+		// We attach to the line AT the insertion point.
+		// The panel floats to the right of this line.
+		// The dashed line connects the start of this line to the panel.
+		// This indicates that the new text will be inserted at this line position (pushing the current line down).
+		const marginCheckLine = anchorLine;
+		const margin = getDynamicMargin(editor, marginCheckLine, fullBlock);
+
+		const topOffset = '0';
+
+		// Dashed line style
+		// We use 'before' decoration for the line.
+		// It needs to be absolute, full width (or enough to reach left), 
+		// and aligned with the panel top.
+		const beforeDecoration = {
+			contentText: '',
+			textDecoration: `none; position: absolute; left: 0; width: 100vw; border-top: 1px dashed var(--vscode-charts-purple); top: 0; height: 0; z-index: 99; pointer-events: none;`
+		};
 
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			before: beforeDecoration,
 			after: {
 				contentText: '',
 				color: new vscode.ThemeColor('charts.purple'),
@@ -314,7 +340,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				fontStyle: 'italic',
 				fontWeight: '600',
 				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top; top: ${topOffset};`
 			}
 		});
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
