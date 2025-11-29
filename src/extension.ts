@@ -195,6 +195,49 @@ function disposePreviewDecorations() {
 	decorationReplaceBlockType = undefined;
 }
 
+function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: string): string {
+	// Count lines in the preview text
+	const lines = text.split(/\r?\n/);
+	const height = lines.length;
+	
+	// We need to check the document lines that will be covered by this panel.
+	// The panel starts at 'anchorLine' and extends downwards by 'height' lines.
+	// However, visually, since it's 'after', it sits to the right of 'anchorLine',
+	// and then flows down.
+	// So we check document lines from anchorLine to anchorLine + height - 1.
+	
+	const doc = editor.document;
+	let maxLen = 0;
+	const startLine = anchorLine;
+	const endLine = Math.min(doc.lineCount - 1, anchorLine + height - 1);
+	
+	for (let i = startLine; i <= endLine; i++) {
+		const lineText = doc.lineAt(i).text;
+		// Simple approximation: assume tabs are 4 spaces if we can't get config easily, 
+		// or just treat them as 1 char (which might underestimate). 
+		// Better to overestimate: treat tab as 4 chars.
+		const len = lineText.replace(/\t/g, '    ').length;
+		if (len > maxLen) {
+			maxLen = len;
+		}
+	}
+	
+	// Length of the anchor line itself
+	const anchorLineText = doc.lineAt(anchorLine).text;
+	const anchorLen = anchorLineText.replace(/\t/g, '    ').length;
+	
+	// The offset needed is maxLen - anchorLen.
+	// If maxLen <= anchorLen, offset is 0 (margin is just base padding).
+	// If maxLen > anchorLen, we need to push right by (maxLen - anchorLen).
+	
+	const diff = Math.max(0, maxLen - anchorLen);
+	// Base margin 2rem is roughly 4ch. Let's use ch units for everything to be consistent.
+	// 1ch is width of '0'. In monospace, mostly consistent.
+	// Add 3ch extra padding for safety/visual gap.
+	const margin = diff + 4; 
+	return `${margin}ch`;
+}
+
 function showPreviewUI(plan: PlannedAction[]): void {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
@@ -218,7 +261,8 @@ function showPreviewUI(plan: PlannedAction[]): void {
 		// For setSelections, we only preview the primary selection's start/active position
 		const selection = next.selections[0];
 		const targetPos = new vscode.Position(selection.start[0], selection.start[1]);
-		
+		const margin = getDynamicMargin(editor, targetPos.line, "↳ Move Cursor Here");
+
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
 				contentText: '',
@@ -226,117 +270,108 @@ function showPreviewUI(plan: PlannedAction[]): void {
 				backgroundColor: new vscode.ThemeColor('editor.background'),
 				fontStyle: 'italic',
 				fontWeight: '600',
-				margin: '0',
-				textDecoration: `none; display: block; white-space: pre; content: "↳ Move Cursor Here"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
+				margin: `0 0 0 ${margin}`,
+				textDecoration: `none; display: inline-block; white-space: pre; content: "↳ Move Cursor Here"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
-		// If target is EOF/empty line, we might need 'after' or 'before'.
-		// 'after' on the target position usually works if line exists.
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(targetPos, targetPos) }]);
 	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
 		const cmd = next.text.replace(/"/g, '\\"').replace(/\r?\n/g, '\\A ');
+		const margin = getDynamicMargin(editor, cursor.line, "↳ Execute in Terminal:\n" + next.text);
+
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
 				contentText: '',
 				color: new vscode.ThemeColor('charts.purple'),
-					backgroundColor: new vscode.ThemeColor('editor.background'),
-					fontStyle: 'italic',
-					fontWeight: '600',
-					margin: '0',
-					textDecoration: `none; display: block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
-				}
-			});
-			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
-		} else if (next.kind === 'editInsert') {
-			const pos = new vscode.Position(next.position[0], next.position[1]);
-			const fullBlock = next.text;
-			const cssContent = fullBlock
-				.replace(/"/g, '\\"')
-				.replace(/\r?\n/g, '\\A ');
-	
-			decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-				before: {
-					contentText: '',
-					color: new vscode.ThemeColor('charts.purple'),
-					backgroundColor: new vscode.ThemeColor('editor.background'),
-					fontStyle: 'italic',
-					fontWeight: '600',
-					margin: '0',
-					textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
-				}
-			});
-			editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(pos, pos) }]);
-		} else if (next.kind === 'editDelete') {
-			const range = new vscode.Range(
-				new vscode.Position(next.range.start[0], next.range.start[1]),
-				new vscode.Position(next.range.end[0], next.range.end[1])
-			);
-			decorationDeleteType = vscode.window.createTextEditorDecorationType({
-				backgroundColor: 'rgba(255, 60, 60, 0.18)',
-				border: '1px solid rgba(255, 60, 60, 0.35)',
-				textDecoration: 'line-through'
-			});
-			editor.setDecorations(decorationDeleteType, [{ range }]);
-		} else if (next.kind === 'editReplace') {
-			const range = new vscode.Range(
-				new vscode.Position(next.range.start[0], next.range.start[1]),
-				new vscode.Position(next.range.end[0], next.range.end[1])
-			);
-			// Highlight original range (to be replaced)
-			decorationReplaceType = vscode.window.createTextEditorDecorationType({
-				backgroundColor: 'rgba(255,165,0,0.15)',
-				border: '1px dashed rgba(255,165,0,0.45)',
-				color: new vscode.ThemeColor('disabledForeground'),
-				textDecoration: 'line-through'
-			});
-			editor.setDecorations(decorationReplaceType, [{ range }]);
-	
-			// Show replacement block on the line after the replaced range
-			const fullBlock = next.text;
-			
-			// CSS-escape the text for the 'content' property:
-			// - Escape double quotes
-			// - Replace newlines with \A (CSS newline)
-			const cssContent = fullBlock
-				.replace(/"/g, '\\"')
-				.replace(/\r?\n/g, '\\A '); 
-	
-			// Determine target for the "lines after" decoration
-			const docLineCount = editor.document.lineCount;
-			const endLine = range.end.line;
-			
-			if (endLine + 1 < docLineCount) {
-				// Attach 'before' decoration to the start of the NEXT line
-				const nextLineStart = new vscode.Position(endLine + 1, 0);
-				decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-					before: {
-						contentText: '', // Handled by CSS content
-						color: new vscode.ThemeColor('charts.purple'),
-						backgroundColor: new vscode.ThemeColor('editor.background'),
-						fontStyle: 'italic',
-						fontWeight: '600',
-						margin: '0',
-						textDecoration: `none; display: block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
-					}
-				});
-				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(nextLineStart, nextLineStart) }]);
-			} else {
-				// EOF: Attach 'after' decoration to the end of the current line
-				decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-					after: {
-						contentText: '', // Handled by CSS content
-						color: new vscode.ThemeColor('charts.purple'),
-						backgroundColor: new vscode.ThemeColor('editor.background'),
-						fontStyle: 'italic',
-						fontWeight: '600',
-						margin: '0',
-						textDecoration: `none; display: block; white-space: pre; content: "\\A ${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative;`
-					}
-				});
-				editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(range.end, range.end) }]);
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: `0 0 0 ${margin}`,
+				textDecoration: `none; display: inline-block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
-		}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(cursor, cursor) }]);
+	} else if (next.kind === 'editInsert') {
+		const posLine = next.position[0];
+		const fullBlock = next.text;
+		const cssContent = fullBlock
+			.replace(/"/g, '\\"')
+			.replace(/\r?\n/g, '\\A ');
+
+		// "Next to" logic:
+		// If inserting at line N > 0, we attach 'after' to line N-1.
+		// If inserting at line 0, we attach 'after' to line 0 (best effort).
+		const anchorLine = posLine > 0 ? posLine - 1 : 0;
+		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE); // End of anchor line
+		const margin = getDynamicMargin(editor, anchorLine, fullBlock);
+
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '',
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: `0 0 0 ${margin}`,
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+			}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
+	} else if (next.kind === 'editDelete') {
+		const range = new vscode.Range(
+			new vscode.Position(next.range.start[0], next.range.start[1]),
+			new vscode.Position(next.range.end[0], next.range.end[1])
+		);
+		decorationDeleteType = vscode.window.createTextEditorDecorationType({
+			backgroundColor: 'rgba(255, 60, 60, 0.18)',
+			border: '1px solid rgba(255, 60, 60, 0.35)',
+			textDecoration: 'line-through'
+		});
+		editor.setDecorations(decorationDeleteType, [{ range }]);
+	} else if (next.kind === 'editReplace') {
+		const range = new vscode.Range(
+			new vscode.Position(next.range.start[0], next.range.start[1]),
+			new vscode.Position(next.range.end[0], next.range.end[1])
+		);
+		// Highlight original range (to be replaced)
+		decorationReplaceType = vscode.window.createTextEditorDecorationType({
+			backgroundColor: 'rgba(255,165,0,0.15)',
+			border: '1px dashed rgba(255,165,0,0.45)',
+			color: new vscode.ThemeColor('disabledForeground'),
+			textDecoration: 'line-through'
+		});
+		editor.setDecorations(decorationReplaceType, [{ range }]);
+
+		// Show replacement block to the right of the first replaced line
+		const fullBlock = next.text;
+		
+		// CSS-escape the text for the 'content' property:
+		// - Escape double quotes
+		// - Replace newlines with \A (CSS newline)
+		const cssContent = fullBlock
+			.replace(/"/g, '\\"')
+			.replace(/\r?\n/g, '\\A '); 
+
+		// Attach 'after' decoration to the start of the replacement range
+		// (Actually, attaching to the end of the first line is safer for 'after')
+		const anchorLine = range.start.line;
+		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE);
+		const margin = getDynamicMargin(editor, anchorLine, fullBlock);
+
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '', // Handled by CSS content
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: `0 0 0 ${margin}`,
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+			}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
+	}
 
 	previewVisible = true;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
