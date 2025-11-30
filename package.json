@@ -17,10 +17,6 @@
   "contributes": {
     "commands": [
       {
-        "command": "crowd-pilot.testRun",
-        "title": "Test Run"
-      },
-      {
         "command": "crowd-pilot.hideUi",
         "title": "crowd-pilot: Hide Preview"
       },

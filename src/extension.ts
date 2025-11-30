@@ -14,14 +14,6 @@ export function activate(context: vscode.ExtensionContext) {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
 		const commandsToSkipShell = config.get<string[]>('commandsToSkipShell', []);
 		let updated = false;
-		if (!commandsToSkipShell.includes('crowd-pilot.testRun')) {
-			commandsToSkipShell.push('crowd-pilot.testRun');
-			updated = true;
-		}
-		if (!commandsToSkipShell.includes('crowd-pilot.previewNoop')) {
-			commandsToSkipShell.push('crowd-pilot.previewNoop');
-			updated = true;
-		}
 		if (!commandsToSkipShell.includes('crowd-pilot.modelRun')) {
 			commandsToSkipShell.push('crowd-pilot.modelRun');
 			updated = true;
@@ -71,29 +63,6 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	const previewNoop = vscode.commands.registerCommand('crowd-pilot.previewNoop', () => {});
-
-	const testRun = vscode.commands.registerCommand('crowd-pilot.testRun', async () => {
-		const editor = vscode.window.activeTextEditor;
-		if (!editor) {
-			return;
-		}
-		try {
-			const plan = buildMockPlan(editor);
-			if (!previewVisible) {
-				showPreviewUI(plan);
-				return;
-			}
-			const runPlan = currentPlan ?? plan;
-			hidePreviewUI();
-			await executePlan(runPlan);
-			vscode.window.showInformationMessage('All actions emitted (mock)');
-		} catch (err) {
-			const errorMessage = err instanceof Error ? err.message : String(err);
-			vscode.window.showErrorMessage(`Mock run failed: ${errorMessage}`);
-		}
-	});
-
 	// Auto-preview listeners
 	const onSelChange = vscode.window.onDidChangeTextEditorSelection((e) => {
 		if (e.textEditor === vscode.window.activeTextEditor) {
@@ -112,7 +81,7 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	context.subscriptions.push(hideUi, sglangTest, modelRun, testRun, previewNoop, onSelChange, onActiveChange, onDocChange);
+	context.subscriptions.push(hideUi, sglangTest, modelRun, onSelChange, onActiveChange, onDocChange);
 }
 
 export function deactivate() {}
@@ -512,7 +481,7 @@ function advanceMockStep(): void {
 	mockStep = (mockStep + 1) % 5;
 }
 
-function autoShowNextAction(): void {
+async function autoShowNextAction(): Promise<void> {
 	if (suppressAutoPreview) { return; }
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
@@ -678,22 +647,6 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 		throw new Error('No valid actions parsed from model output');
 	}
 	return actions;
-}
-
-// -------------------- Mock Actions (offline/local debug) --------------------
-function buildMockPlan(editor: vscode.TextEditor): PlannedAction[] {
-	const cursor = editor.selection.active;
-	const insertPosition: [number, number] = [cursor.line, cursor.character];
-	const selections = [
-		{ start: [cursor.line, cursor.character] as [number, number], end: [cursor.line, cursor.character] as [number, number] }
-	];
-	return [
-		{ kind: 'showTextDocument' },
-		{ kind: 'setSelections', selections },
-		{ kind: 'editInsert', position: insertPosition, text: '// crowd-pilot mock insert\n' },
-		{ kind: 'terminalShow' },
-		{ kind: 'terminalSendText', text: 'echo "[crowd-pilot] mock run"' }
-	];
 }
 
 function extractChatContent(json: any): string | undefined {
