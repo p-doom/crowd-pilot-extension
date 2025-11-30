@@ -38,7 +38,7 @@
         "command": "crowd-pilot.modelRun",
         "key": "tab",
         "mac": "tab",
-        "when": "editorTextFocus || terminalFocus"
+        "when": "editorTextFocus && crowdPilot.uiVisible"
       },
       {
         "command": "crowd-pilot.modelRun",
