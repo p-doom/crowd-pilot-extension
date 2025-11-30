@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as http from 'http';
 import { Buffer } from 'buffer';
 
-const HOSTNAME = 'hai005';
+const HOSTNAME = 'hai001';
 const PORT = 30000;
 
 export function activate(context: vscode.ExtensionContext) {
@@ -39,14 +39,18 @@ export function activate(context: vscode.ExtensionContext) {
 		try {
 			// Confirm only when a suggestion is visible
 			if (!previewVisible) { return; }
-			const action = currentPlan?.[0] ?? getHardcodedNextAction(editor);
+			let action: PlannedAction | undefined = currentAction;
+			if (!action) {
+				const single = await requestModelActions(editor);
+				currentAction = single;
+				action = single;
+			}
 			if (!action) {
 				hidePreviewUI();
 				return;
 			}
 			hidePreviewUI(false);
-			await executePlan([action]);
-			advanceMockStep();
+			await executeAction(action);
 			autoShowNextAction();
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
@@ -96,56 +100,54 @@ type PlannedAction =
 | { kind: 'terminalShow' }
 | { kind: 'terminalSendText', text: string };
 
-let currentPlan: PlannedAction[] | undefined;
+let currentAction: PlannedAction | undefined;
 
-async function executePlan(plan: PlannedAction[]): Promise<void> {
+async function executeAction(action: PlannedAction): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
 	const doc = editor.document;
 	const term = vscode.window.terminals[0] ?? vscode.window.createTerminal('Test');
-	for (const action of plan) {
-		if (action.kind === 'showTextDocument') {
-			await vscode.window.showTextDocument(doc);
-			continue;
+	if (action.kind === 'showTextDocument') {
+		await vscode.window.showTextDocument(doc);
+		return;
+	}
+	if (action.kind === 'setSelections') {
+		editor.selections = action.selections.map(s => new vscode.Selection(
+			new vscode.Position(s.start[0], s.start[1]),
+			new vscode.Position(s.end[0], s.end[1])
+		));
+		if (editor.selections.length > 0) {
+			editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 		}
-		if (action.kind === 'setSelections') {
-			editor.selections = action.selections.map(s => new vscode.Selection(
-				new vscode.Position(s.start[0], s.start[1]),
-				new vscode.Position(s.end[0], s.end[1])
-			));
-			if (editor.selections.length > 0) {
-				editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-			}
-			continue;
-		}
-		if (action.kind === 'editInsert') {
-			await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
-			continue;
-		}
-		if (action.kind === 'editDelete') {
-			const range = new vscode.Range(
-				new vscode.Position(action.range.start[0], action.range.start[1]),
-				new vscode.Position(action.range.end[0], action.range.end[1])
-			);
-			await editor.edit((e: vscode.TextEditorEdit) => e.delete(range));
-			continue;
-		}
-		if (action.kind === 'editReplace') {
-			const range = new vscode.Range(
-				new vscode.Position(action.range.start[0], action.range.start[1]),
-				new vscode.Position(action.range.end[0], action.range.end[1])
-			);
-			await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
-			continue;
-		}
-		if (action.kind === 'terminalShow') {
-			term.show();
-			continue;
-		}
-		if (action.kind === 'terminalSendText') {
-			term.sendText(action.text);
-			continue;
-		}
+		return;
+	}
+	if (action.kind === 'editInsert') {
+		await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
+		return;
+	}
+	if (action.kind === 'editDelete') {
+		const range = new vscode.Range(
+			new vscode.Position(action.range.start[0], action.range.start[1]),
+			new vscode.Position(action.range.end[0], action.range.end[1])
+		);
+		await editor.edit((e: vscode.TextEditorEdit) => e.delete(range));
+		return;
+	}
+	if (action.kind === 'editReplace') {
+		const range = new vscode.Range(
+			new vscode.Position(action.range.start[0], action.range.start[1]),
+			new vscode.Position(action.range.end[0], action.range.end[1])
+		);
+		await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
+		return;
+	}
+	if (action.kind === 'terminalShow') {
+		term.show();
+		return;
+	}
+	if (action.kind === 'terminalSendText') {
+		term.sendText(action.text);
+		return;
 	}
 }
 
@@ -210,17 +212,17 @@ function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: s
 	return `${margin}ch`;
 }
 
-function showPreviewUI(plan: PlannedAction[]): void {
+function showPreviewUI(action: PlannedAction): void {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
 	disposePreviewDecorations();
 
-	// Only preview the next text edit action (insert/delete/replace/terminalSendText/setSelections)
-	const next = plan.find(a => a.kind === 'editInsert' || a.kind === 'editDelete' || a.kind === 'editReplace' || a.kind === 'terminalSendText' || a.kind === 'setSelections');
+	// FIXME (f.srambical): add file switch 
+	const next = (action.kind === 'editInsert' || action.kind === 'editDelete' || action.kind === 'editReplace' || action.kind === 'terminalSendText' || action.kind === 'setSelections') ? action : undefined;
 	if (!next) {
 		previewVisible = false;
 		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
-		currentPlan = plan;
+		currentAction = action;
 		return;
 	}
 
@@ -396,7 +398,7 @@ function showPreviewUI(plan: PlannedAction[]): void {
 
 	previewVisible = true;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
-	currentPlan = plan;
+	currentAction = action;
 }
 
 function hidePreviewUI(suppress?: boolean): void {
@@ -485,10 +487,14 @@ async function autoShowNextAction(): Promise<void> {
 	if (suppressAutoPreview) { return; }
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
-	const next = getHardcodedNextAction(editor);
-	if (next) {
-		showPreviewUI([next]);
-	} else {
+	try {
+		const next = await requestModelActions(editor);
+		if (next) {
+			showPreviewUI(next);
+		} else {
+			hidePreviewUI();
+		}
+	} catch (err) {
 		hidePreviewUI();
 	}
 }
@@ -546,10 +552,10 @@ async function callSGLangChat(): Promise<void> {
 }
 
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction[]> {
+async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction> {
 	const schemaDescription = [
 		'Role: You suggest the next VS Code editor/terminal action to progress the current task.',
-		'Output ONLY a JSON array (no prose, no code fences). Length exactly 1.',
+		'Output ONLY a JSON object (no prose, no code fences).',
 		'Coordinates are zero-based [line, column].',
 		'Allowed actions (JSON schema-like):',
 		'{ kind: "showTextDocument" }',
@@ -567,23 +573,8 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 
 	const doc = editor.document;
 	const cursor = editor.selection.active;
-	const contextRange = new vscode.Range(new vscode.Position(0, 0), cursor);
-	const contextCode = doc.getText(contextRange);
-	const maxContextChars = 20000;
-	const allLines = contextCode.split(/\r?\n/);
-	let startLineIndex = 0;
-	let visibleLines = allLines;
-	if (contextCode.length > maxContextChars) {
-		let acc = 0;
-		let idx = allLines.length;
-		while (idx > 0 && acc <= maxContextChars) {
-			idx--;
-			acc += allLines[idx].length + 1;
-		}
-		startLineIndex = idx;
-		visibleLines = allLines.slice(idx);
-	}
-	const numberedContext = visibleLines.map((line, i) => `${startLineIndex + i}: ${line}`).join('\n');
+	const fullText = doc.getText();
+	const numberedContext = fullText.split(/\r?\n/).map((line, i) => `${i}: ${line}`).join('\n');
 
 	const tabbingPrompt = [
 		'Your role: Propose the single next action according to the schema to help the developer progress.',
@@ -593,12 +584,12 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 		`- Language: ${doc.languageId}`,
 		`- Cursor: (${cursor.line}, ${cursor.character})`,
 		'',
-		'Current file content up to the cursor (zero-based line numbers):',
+		'Full file content (zero-based line numbers):',
 		'```',
 		numberedContext,
 		'```',
 		'',
-		'Respond with ONLY a JSON array containing exactly one action.'
+		'Respond with ONLY a JSON object containing exactly one action.'
 	].join('\n');
 
 	const requestBody = {
@@ -642,11 +633,11 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const actions = parsePlannedActions(content);
-	if (actions.length === 0) {
-		throw new Error('No valid actions parsed from model output');
+	const action = parsePlannedAction(content);
+	if (!action) {
+		throw new Error('No valid action parsed from model output');
 	}
-	return actions;
+	return action;
 }
 
 function extractChatContent(json: any): string | undefined {
@@ -666,64 +657,54 @@ function extractChatContent(json: any): string | undefined {
 	}
 }
 
-function parsePlannedActions(raw: string): PlannedAction[] {
+function parsePlannedAction(raw: string): PlannedAction | undefined {
 	let text = raw.trim();
 	text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-	const arrayMatch = text.match(/\[[\s\S]*\]/);
-	const jsonText = arrayMatch ? arrayMatch[0] : text;
-	let parsed: unknown;
+	text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+	let parsed: any;
 	try {
-		parsed = JSON.parse(jsonText);
+		parsed = JSON.parse(text);
 	} catch (err) {
-		return [];
+		return undefined;
 	}
-	if (!Array.isArray(parsed)) { return []; }
-	const result: PlannedAction[] = [];
-	for (const item of parsed) {
-		if (!item || typeof item !== 'object' || typeof (item as any).kind !== 'string') { continue; }
-		switch ((item as any).kind) {
-			case 'showTextDocument':
-				result.push({ kind: 'showTextDocument' });
-				break;
-			case 'setSelections': {
-				const selections = Array.isArray((item as any).selections) ? (item as any).selections : [];
-				const norm = selections.map((s: any) => ({
-					start: Array.isArray(s?.start) && s.start.length === 2 ? [Number(s.start[0]) || 0, Number(s.start[1]) || 0] as [number, number] : [0, 0] as [number, number],
-					end: Array.isArray(s?.end) && s.end.length === 2 ? [Number(s.end[0]) || 0, Number(s.end[1]) || 0] as [number, number] : [0, 0] as [number, number]
-				}));
-				result.push({ kind: 'setSelections', selections: norm });
-				break;
-			}
-			case 'editInsert': {
-				const pos = Array.isArray((item as any).position) && (item as any).position.length === 2 ? [Number((item as any).position[0]) || 0, Number((item as any).position[1]) || 0] as [number, number] : [0, 0] as [number, number];
-				const text = typeof (item as any).text === 'string' ? (item as any).text : '';
-				result.push({ kind: 'editInsert', position: pos, text });
-				break;
-			}
-			case 'editDelete': {
-				const start = Array.isArray((item as any).range?.start) && (item as any).range.start.length === 2 ? [Number((item as any).range.start[0]) || 0, Number((item as any).range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
-				const end = Array.isArray((item as any).range?.end) && (item as any).range.end.length === 2 ? [Number((item as any).range.end[0]) || 0, Number((item as any).range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
-				result.push({ kind: 'editDelete', range: { start, end } });
-				break;
-			}
-			case 'editReplace': {
-				const start = Array.isArray((item as any).range?.start) && (item as any).range.start.length === 2 ? [Number((item as any).range.start[0]) || 0, Number((item as any).range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
-				const end = Array.isArray((item as any).range?.end) && (item as any).range.end.length === 2 ? [Number((item as any).range.end[0]) || 0, Number((item as any).range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
-				const text = typeof (item as any).text === 'string' ? (item as any).text : '';
-				result.push({ kind: 'editReplace', range: { start, end }, text });
-				break;
-			}
-			case 'terminalShow':
-				result.push({ kind: 'terminalShow' });
-				break;
-			case 'terminalSendText': {
-				const text = typeof (item as any).text === 'string' ? (item as any).text : '';
-				result.push({ kind: 'terminalSendText', text });
-				break;
-			}
-			default:
-				break;
+	if (Array.isArray(parsed)) {
+		console.error('Model should not return an array.');
+		return undefined;
+	}
+	switch (parsed.kind) {
+		case 'showTextDocument':
+			return { kind: 'showTextDocument' };
+		case 'setSelections': {
+			const selections = Array.isArray(parsed.selections) ? parsed.selections : [];
+			const norm = selections.map((s: any) => ({
+				start: Array.isArray(s?.start) && s.start.length === 2 ? [Number(s.start[0]) || 0, Number(s.start[1]) || 0] as [number, number] : [0, 0] as [number, number],
+				end: Array.isArray(s?.end) && s.end.length === 2 ? [Number(s.end[0]) || 0, Number(s.end[1]) || 0] as [number, number] : [0, 0] as [number, number]
+			}));
+			return { kind: 'setSelections', selections: norm };
 		}
+		case 'editInsert': {
+			const pos = Array.isArray(parsed.position) && parsed.position.length === 2 ? [Number(parsed.position[0]) || 0, Number(parsed.position[1]) || 0] as [number, number] : [0, 0] as [number, number];
+			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
+			return { kind: 'editInsert', position: pos, text: textVal };
+		}
+		case 'editDelete': {
+			const start = Array.isArray(parsed.range?.start) && parsed.range.start.length === 2 ? [Number(parsed.range.start[0]) || 0, Number(parsed.range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
+			const end = Array.isArray(parsed.range?.end) && parsed.range.end.length === 2 ? [Number(parsed.range.end[0]) || 0, Number(parsed.range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
+			return { kind: 'editDelete', range: { start, end } };
+		}
+		case 'editReplace': {
+			const start = Array.isArray(parsed.range?.start) && parsed.range.start.length === 2 ? [Number(parsed.range.start[0]) || 0, Number(parsed.range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
+			const end = Array.isArray(parsed.range?.end) && parsed.range.end.length === 2 ? [Number(parsed.range.end[0]) || 0, Number(parsed.range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
+			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
+			return { kind: 'editReplace', range: { start, end }, text: textVal };
+		}
+		case 'terminalShow':
+			return { kind: 'terminalShow' };
+		case 'terminalSendText': {
+			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
+			return { kind: 'terminalSendText', text: textVal };
+		}
+		default:
+			return undefined;
 	}
-	return result;
 }
