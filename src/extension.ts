@@ -1,9 +1,20 @@
 import * as vscode from 'vscode';
+import * as https from 'https';
 import * as http from 'http';
 import { Buffer } from 'buffer';
 
-const HOSTNAME = 'hai001';
-const PORT = 30000;
+
+const SGLANG_HOSTNAME = 'hai001';
+const SGLANG_PORT = 30000;
+const SGLANG_BASE_PATH = '/v1/chat/completions';
+const SGLANG_MODEL_NAME = 'qwen/qwen3-0.6b';
+
+const GEMINI_HOSTNAME = 'generativelanguage.googleapis.com';
+const GEMINI_PORT = 443;
+const GEMINI_BASE_PATH = '/v1beta/openai/chat/completions';
+const GEMINI_MODEL_NAME = 'gemini-2.5-flash';
+
+const USE_GEMINI = true;
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -501,28 +512,60 @@ async function autoShowNextAction(): Promise<void> {
 
 // -------------------- SGLang Client (simple test) --------------------
 async function callSGLangChat(): Promise<void> {
+	const config = vscode.workspace.getConfiguration();
+	
+	let hostname: string;
+	let port: number;
+	let path: string;
+	let useHttps = true;
+	let modelName: string;
+	const headers: any = {
+		'Content-Type': 'application/json'
+	};
+
+	if (!USE_GEMINI) {
+		// SGLang
+		hostname = SGLANG_HOSTNAME;
+		port = SGLANG_PORT;
+		path = SGLANG_BASE_PATH;
+		useHttps = false; 
+		modelName = SGLANG_MODEL_NAME;
+	} else {
+		// Gemini
+		const apiKey = config.get<string>('crowd-pilot.apiKey');
+		if (!apiKey) {
+			vscode.window.showErrorMessage('Crowd Pilot: Please set your API Key in settings (crowd-pilot.apiKey).');
+			return;
+		}
+		hostname = GEMINI_HOSTNAME;
+		port = GEMINI_PORT;
+		path = GEMINI_BASE_PATH;
+		headers['Authorization'] = `Bearer ${apiKey}`;
+		modelName = GEMINI_MODEL_NAME;
+	}
+
 	const requestBody = {
-		model: 'qwen/qwen2.5-0.5b-instruct',
+		model: modelName,
 		messages: [
 			{ role: 'user', content: 'What is the capital of France?' }
 		]
 	};
 	const postData = JSON.stringify(requestBody);
+	headers['Content-Length'] = Buffer.byteLength(postData);
 
 	const options = {
-		hostname: HOSTNAME,
-		port: PORT,
-		path: '/v1/chat/completions',
+		hostname,
+		port,
+		path,
 		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			'Content-Length': Buffer.byteLength(postData)
-		}
+		headers
 	};
+
+	const requestModule = useHttps ? https : http;
 
 	try {
 		const json = await new Promise<any>((resolve, reject) => {
-			const req = http.request(options, (res: http.IncomingMessage) => {
+			const req = requestModule.request(options, (res: http.IncomingMessage) => {
 				let data = '';
 				res.on('data', (chunk: Buffer) => {
 					data += chunk.toString();
@@ -544,15 +587,47 @@ async function callSGLangChat(): Promise<void> {
 			req.end();
 		});
 
-		vscode.window.showInformationMessage(`SGLang response: ${JSON.stringify(json, null, 2)}`);
+		vscode.window.showInformationMessage(`Response: ${JSON.stringify(json, null, 2)}`);
 	} catch (err) {
 		const errorMessage = err instanceof Error ? err.message : String(err);
-		vscode.window.showErrorMessage(`SGLang request failed: ${errorMessage}`);
+		vscode.window.showErrorMessage(`Request failed: ${errorMessage}`);
 	}
 }
 
 // -------------------- Model-planned Actions --------------------
 async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction> {
+	const config = vscode.workspace.getConfiguration();
+	
+	let hostname: string;
+	let port: number;
+	let path: string;
+	let useHttps = true;
+	let modelName: string;
+	const headers: any = {
+		'Content-Type': 'application/json'
+	};
+
+	if (!USE_GEMINI) {
+		// SGLang
+		hostname = SGLANG_HOSTNAME;
+		port = SGLANG_PORT;
+		path = SGLANG_BASE_PATH;
+		useHttps = false;
+		modelName = SGLANG_MODEL_NAME;
+	} else {
+		// Gemini
+		const apiKey = config.get<string>('crowd-pilot.apiKey');
+		if (!apiKey) {
+			vscode.window.showErrorMessage('Crowd Pilot: Please set your API Key in settings (crowd-pilot.apiKey).');
+			throw new Error('API key not set');
+		}
+		hostname = GEMINI_HOSTNAME;
+		port = GEMINI_PORT;
+		path = GEMINI_BASE_PATH;
+		headers['Authorization'] = `Bearer ${apiKey}`;
+		modelName = GEMINI_MODEL_NAME;
+	}
+
 	const schemaDescription = [
 		'Role: You suggest the next VS Code editor/terminal action to progress the current task.',
 		'Output ONLY a JSON object (no prose, no code fences).',
@@ -593,7 +668,7 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 	].join('\n');
 
 	const requestBody = {
-		model: 'qwen/qwen2.5-0.5b-instruct',
+		model: modelName,
 		messages: [
 			{ role: 'system', content: schemaDescription },
 			{ role: 'user', content: tabbingPrompt }
@@ -601,19 +676,20 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 	};
 
 	const postData = JSON.stringify(requestBody);
+	headers['Content-Length'] = Buffer.byteLength(postData);
+
 	const options = {
-		hostname: HOSTNAME,
-		port: PORT,
-		path: '/v1/chat/completions',
+		hostname,
+		port,
+		path,
 		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			'Content-Length': Buffer.byteLength(postData)
-		}
+		headers
 	};
 
+	const requestModule = useHttps ? https : http;
+
 	const json = await new Promise<any>((resolve, reject) => {
-		const req = http.request(options, (res: http.IncomingMessage) => {
+		const req = requestModule.request(options, (res: http.IncomingMessage) => {
 			let data = '';
 			res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
 			res.on('end', () => {
