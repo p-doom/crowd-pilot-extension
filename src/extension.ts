@@ -4,7 +4,7 @@ import * as http from 'http';
 import { Buffer } from 'buffer';
 
 
-const SGLANG_HOSTNAME = 'hai001';
+const SGLANG_HOSTNAME = 'hai007';
 const SGLANG_PORT = 30000;
 const SGLANG_BASE_PATH = '/v1/chat/completions';
 const SGLANG_MODEL_NAME = 'qwen/qwen3-0.6b';
@@ -14,7 +14,7 @@ const GEMINI_PORT = 443;
 const GEMINI_BASE_PATH = '/v1beta/openai/chat/completions';
 const GEMINI_MODEL_NAME = 'gemini-2.5-flash';
 
-const USE_GEMINI = true;
+const USE_GEMINI = false;
 
 export function activate(context: vscode.ExtensionContext) {
 
@@ -79,20 +79,23 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	// Auto-preview listeners
+	const debouncedAutoPreview = debounce(() => {
+		autoShowNextAction();
+	}, 250);
 	const onSelChange = vscode.window.onDidChangeTextEditorSelection((e) => {
 		if (e.textEditor === vscode.window.activeTextEditor) {
 			suppressAutoPreview = false;
-			autoShowNextAction();
+			debouncedAutoPreview();
 		}
 	});
 	const onActiveChange = vscode.window.onDidChangeActiveTextEditor(() => {
 		suppressAutoPreview = false;
-		autoShowNextAction();
+		debouncedAutoPreview();
 	});
 	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
 		if (vscode.window.activeTextEditor?.document === e.document) {
 			suppressAutoPreview = false;
-			autoShowNextAction();
+			debouncedAutoPreview();
 		}
 	});
 
@@ -170,6 +173,8 @@ let decorationReplaceType: vscode.TextEditorDecorationType | undefined;
 let decorationReplaceBlockType: vscode.TextEditorDecorationType | undefined;
 let mockStep = 0;
 let suppressAutoPreview = false;
+let latestRequestId = 0;
+let currentAbortController: AbortController | undefined;
 
 function disposePreviewDecorations() {
 	try { decorationDeleteType?.dispose(); } catch {}
@@ -178,6 +183,14 @@ function disposePreviewDecorations() {
 	decorationDeleteType = undefined;
 	decorationReplaceType = undefined;
 	decorationReplaceBlockType = undefined;
+}
+
+function debounce<T extends (...args: any[]) => void>(fn: T, waitMs: number) {
+	let timer: NodeJS.Timeout | undefined;
+	return (...args: Parameters<T>) => {
+		if (timer) { clearTimeout(timer); }
+		timer = setTimeout(() => fn(...args), waitMs);
+	};
 }
 
 function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: string): string {
@@ -286,8 +299,9 @@ function showPreviewUI(action: PlannedAction): void {
 	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
 		const lineEnd = editor.document.lineAt(cursor.line).range.end;
-		const cmd = next.text.replace(/"/g, '\\"').replace(/\r?\n/g, '\\A ');
-		const margin = getDynamicMargin(editor, cursor.line, "↳ Execute in Terminal:\n" + next.text);
+		const summary = trimText(next.text || '');
+		const label = `↳ Execute shell command in terminal: ${summary}`;
+		const margin = getDynamicMargin(editor, cursor.line, label);
 
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
@@ -297,7 +311,7 @@ function showPreviewUI(action: PlannedAction): void {
 				fontStyle: 'italic',
 				fontWeight: '600',
 				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "↳ Execute in Terminal:\\A ${cmd}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${label.replace(/"/g, '\\"')}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(lineEnd, lineEnd) }]);
@@ -499,13 +513,17 @@ async function autoShowNextAction(): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
 	try {
-		const next = await requestModelActions(editor);
-		if (next) {
-			showPreviewUI(next);
-		} else {
-			hidePreviewUI();
-		}
+		currentAbortController?.abort();
+		const controller = new AbortController();
+		currentAbortController = controller;
+		const requestId = ++latestRequestId;
+		const next = await requestModelActions(editor, controller.signal);
+		if (requestId !== latestRequestId) { return; }
+		if (next) { showPreviewUI(next); } else { hidePreviewUI(); }
 	} catch (err) {
+		const e = err as any;
+		const isAbort = e?.name === 'AbortError' || /aborted/i.test(String(e?.message ?? ''));
+		if (isAbort) { return; }
 		hidePreviewUI();
 	}
 }
@@ -544,12 +562,23 @@ async function callSGLangChat(): Promise<void> {
 		modelName = GEMINI_MODEL_NAME;
 	}
 
-	const requestBody = {
+	const requestBody: any = {
 		model: modelName,
 		messages: [
 			{ role: 'user', content: 'What is the capital of France?' }
 		]
 	};
+	if (!USE_GEMINI) {
+		requestBody.temperature = 0.7;
+		requestBody.top_p = 0.8;
+		requestBody.top_k = 20;
+		requestBody.min_p = 0;
+		requestBody.extra_body = {
+			chat_template_kwargs: {
+				enable_thinking: false
+			}
+		};
+	}
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
@@ -594,8 +623,44 @@ async function callSGLangChat(): Promise<void> {
 	}
 }
 
+// -------------------- Prompt Serialization Helpers --------------------
+function formatStdoutBlock(content: string): string {
+	const normalized = content ?? '';
+	return `<stdout>\n${normalized}\n</stdout>`;
+}
+
+function formatLineNumberedOutput(content: string, startLine?: number, endLine?: number): string {
+	const lines = content.split(/\r?\n/);
+	const total = (lines.length === 1 && lines[0] === '') ? 0 : lines.length;
+	if (total === 0) {
+		return '';
+	}
+	const s = startLine !== undefined ? Math.max(1, Math.min(startLine, total)) : 1;
+	const e = endLine !== undefined ? Math.max(s, Math.min(endLine, total)) : total;
+	const buf: string[] = [];
+	for (let idx = s; idx <= e; idx++) {
+		const lineText = lines[idx - 1] ?? '';
+		buf.push(`${idx.toString().padStart(6, ' ')}\t${lineText}`);
+	}
+	return buf.join('\n');
+}
+
+function computeViewport(totalLines: number, centerLine: number, radius: number): { start: number; end: number } {
+	if (totalLines <= 0) {
+		return { start: 1, end: 0 };
+	}
+	const start = Math.max(1, centerLine - radius);
+	const end = Math.min(totalLines, centerLine + radius);
+	return { start, end };
+}
+
+function fencedBashBlock(command: string): string {
+	const cleaned = command.replace(/\r/g, '').trim();
+	return `\`\`\`bash\n${cleaned}\n\`\`\``;
+}
+
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAction> {
+async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<PlannedAction> {
 	const config = vscode.workspace.getConfiguration();
 	
 	let hostname: string;
@@ -628,63 +693,125 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 		modelName = GEMINI_MODEL_NAME;
 	}
 
-	const schemaDescription = [
-		'Role: You suggest the next VS Code editor/terminal action to progress the current task.',
-		'Output ONLY a JSON object (no prose, no code fences).',
-		'Coordinates are zero-based [line, column].',
-		'Allowed actions (JSON schema-like):',
-		'{ kind: "showTextDocument" }',
-		'{ kind: "setSelections", selections: Array<{ start: [number, number], end: [number, number] }> }',
-		'{ kind: "editInsert", position: [number, number], text: string }',
-		'{ kind: "editDelete", range: { start: [number, number], end: [number, number] } }',
-		'{ kind: "editReplace", range: { start: [number, number], end: [number, number] }, text: string }',
-		'{ kind: "terminalShow" }',
-		'{ kind: "terminalSendText", text: string }',
-		'Guidelines:',
-		'- If you you insert text, insert until the logical end of the current statement or block.',
-		'- When inserting text, make sure to not repeat existing text (except when replacing existing text).',
-		'- Use double-quoted JSON strings.'
-	].join('\n');
-
 	const doc = editor.document;
 	const cursor = editor.selection.active;
 	const fullText = doc.getText();
-	const numberedContext = fullText.split(/\r?\n/).map((line, i) => `${i}: ${line}`).join('\n');
-
-	const tabbingPrompt = [
-		'Your role: Propose the single next action according to the schema to help the developer progress.',
-		'',
-		'Available context:',
-		`- File: ${doc.fileName}`,
-		`- Language: ${doc.languageId}`,
-		`- Cursor: (${cursor.line}, ${cursor.character})`,
-		'',
-		'Full file content (zero-based line numbers):',
-		'```',
-		numberedContext,
-		'```',
-		'',
-		'Respond with ONLY a JSON object containing exactly one action.'
+	const filePath = doc.uri.fsPath;
+	const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '(unknown)';
+	const cursorLine = cursor.line + 1;
+	const cursorColumn = cursor.character + 1;
+	const totalLines = doc.lineCount;
+	const viewport = computeViewport(totalLines, cursorLine, 12);
+	const metadataSummary = [
+		`Workspace root: ${workspaceRoot}`,
+		`Active file: ${filePath}`,
+		`Language: ${doc.languageId}`,
+		`Cursor (1-based): line ${cursorLine}, column ${cursorColumn}`
+	].join('\n');
+	const metadataCommand = [
+		"cat <<'EOF'",
+		metadataSummary,
+		'EOF'
 	].join('\n');
 
-	const requestBody = {
+	const systemPrompt = [
+		'You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.',
+		'Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).',
+		'',
+		'Format your response as shown in <format_example>.',
+		'',
+		'<format_example>',
+		'```bash',
+		'your_command_here',
+		'```',
+		'</format_example>',
+		'',
+		'Failure to follow these rules will cause your response to be rejected.',
+		'',
+		'=== EDIT COMMAND FORMAT (IMPORTANT) ===',
+		'When you want to EDIT a file, you MUST encode the edit using line-based sed commands in ONE of the following forms,',
+		'and you MUST NOT use substitution commands like "Ns/old/new/g".',
+		'',
+		'Assume all line numbers are 1-based and paths are absolute.',
+		'Allowed edit encodings (choose exactly one per response):',
+		'',
+		'1) Replace a contiguous block of lines:',
+		"   sed -i 'START,ENDc\\",
+		'NEW_LINE_1',
+		'NEW_LINE_2',
+		"...",
+		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
+		'',
+		'2) Delete a contiguous block of lines:',
+		"   sed -i 'START,ENDd' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
+		'',
+		'3) Insert new lines BEFORE a given line:',
+		"   sed -i 'STARTi\\",
+		'NEW_LINE_1',
+		'NEW_LINE_2',
+		"...",
+		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
+		'',
+		'4) Append new lines at the END of the file:',
+		"   sed -i '$a\\",
+		'NEW_LINE_1',
+		'NEW_LINE_2',
+		"...",
+		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
+		'',
+		'Where VSTART and VEND specify a small viewport around the edited region.',
+		'',
+		'Do NOT emit commands like "3s/print/print()/g" or any other "s/old/new/" style sed substitution; instead,',
+		'always rewrite the affected lines using one of the line-based forms above.',
+		'',
+		'When you are NOT editing files (e.g., running tests, git commands, tools, etc.), you may emit arbitrary bash commands.'
+	].join('\n');
+
+	const conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+		{ role: 'system', content: systemPrompt },
+		{ role: 'assistant', content: fencedBashBlock(metadataCommand) },
+		{ role: 'user', content: formatStdoutBlock(metadataSummary) },
+		{ role: 'assistant', content: fencedBashBlock(`cat -n ${filePath}`) },
+		{ role: 'user', content: formatStdoutBlock(formatLineNumberedOutput(fullText)) }
+	];
+
+	if (viewport.end >= viewport.start) {
+		const viewportOutput = formatLineNumberedOutput(fullText, viewport.start, viewport.end);
+		conversationMessages.push(
+			{ role: 'assistant', content: fencedBashBlock(`cat -n ${filePath} | sed -n '${viewport.start},${viewport.end}p'`) },
+			{ role: 'user', content: formatStdoutBlock(viewportOutput) }
+		);
+	}
+
+	const requestBody: any = {
 		model: modelName,
-		messages: [
-			{ role: 'system', content: schemaDescription },
-			{ role: 'user', content: tabbingPrompt }
-		]
+		messages: conversationMessages
 	};
+	if (!USE_GEMINI) {
+		requestBody.temperature = 0.7;
+		requestBody.top_p = 0.8;
+		requestBody.top_k = 20;
+		requestBody.min_p = 0;
+		requestBody.extra_body = {
+			chat_template_kwargs: {
+				enable_thinking: false
+			}
+		};
+	}
 
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
-	const options = {
+	const options: any = {
 		hostname,
 		port,
 		path,
 		method: 'POST',
 		headers
 	};
+	if (signal) {
+		options.signal = signal;
+	}
 
 	const requestModule = useHttps ? https : http;
 
@@ -709,7 +836,7 @@ async function requestModelActions(editor: vscode.TextEditor): Promise<PlannedAc
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const action = parsePlannedAction(content);
+	const action = parsePlannedAction(content, doc);
 	if (!action) {
 		throw new Error('No valid action parsed from model output');
 	}
@@ -733,54 +860,231 @@ function extractChatContent(json: any): string | undefined {
 	}
 }
 
-function parsePlannedAction(raw: string): PlannedAction | undefined {
-	let text = raw.trim();
-	text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
-	text = text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-	let parsed: any;
-	try {
-		parsed = JSON.parse(text);
-	} catch (err) {
+function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedAction | undefined {
+	const command = extractBashCommand(raw);
+	if (!command) {
 		return undefined;
 	}
-	if (Array.isArray(parsed)) {
-		console.error('Model should not return an array.');
+	const normalized = command.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+	if (!normalized) {
 		return undefined;
 	}
-	switch (parsed.kind) {
-		case 'showTextDocument':
-			return { kind: 'showTextDocument' };
-		case 'setSelections': {
-			const selections = Array.isArray(parsed.selections) ? parsed.selections : [];
-			const norm = selections.map((s: any) => ({
-				start: Array.isArray(s?.start) && s.start.length === 2 ? [Number(s.start[0]) || 0, Number(s.start[1]) || 0] as [number, number] : [0, 0] as [number, number],
-				end: Array.isArray(s?.end) && s.end.length === 2 ? [Number(s.end[0]) || 0, Number(s.end[1]) || 0] as [number, number] : [0, 0] as [number, number]
-			}));
-			return { kind: 'setSelections', selections: norm };
+	// Try to interpret the command as a structured VS Code action derived from the bash transcript.
+	if (doc) {
+		// 1) Edits encoded as sed -i ... (insert/replace/delete)
+		const editAction = parseEditFromSedCommand(normalized, doc);
+		if (editAction) {
+			return editAction;
 		}
-		case 'editInsert': {
-			const pos = Array.isArray(parsed.position) && parsed.position.length === 2 ? [Number(parsed.position[0]) || 0, Number(parsed.position[1]) || 0] as [number, number] : [0, 0] as [number, number];
-			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
-			return { kind: 'editInsert', position: pos, text: textVal };
+		// 2) Viewport / selection moves encoded as cat -n ... | sed -n 'vstart,vendp'
+		const viewportAction = parseViewportFromCatCommand(normalized, doc);
+		if (viewportAction) {
+			return viewportAction;
 		}
-		case 'editDelete': {
-			const start = Array.isArray(parsed.range?.start) && parsed.range.start.length === 2 ? [Number(parsed.range.start[0]) || 0, Number(parsed.range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
-			const end = Array.isArray(parsed.range?.end) && parsed.range.end.length === 2 ? [Number(parsed.range.end[0]) || 0, Number(parsed.range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
-			return { kind: 'editDelete', range: { start, end } };
-		}
-		case 'editReplace': {
-			const start = Array.isArray(parsed.range?.start) && parsed.range.start.length === 2 ? [Number(parsed.range.start[0]) || 0, Number(parsed.range.start[1]) || 0] as [number, number] : [0, 0] as [number, number];
-			const end = Array.isArray(parsed.range?.end) && parsed.range.end.length === 2 ? [Number(parsed.range.end[0]) || 0, Number(parsed.range.end[1]) || 0] as [number, number] : [0, 0] as [number, number];
-			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
-			return { kind: 'editReplace', range: { start, end }, text: textVal };
-		}
-		case 'terminalShow':
-			return { kind: 'terminalShow' };
-		case 'terminalSendText': {
-			const textVal = typeof parsed.text === 'string' ? parsed.text : '';
-			return { kind: 'terminalSendText', text: textVal };
-		}
-		default:
+	}
+	// Fallback: execute the raw command in the integrated terminal.
+	return { kind: 'terminalSendText', text: normalized };
+}
+
+/**
+ * Parse a sed-based edit command of the form emitted by the NeMo serializer into a VS Code edit action.
+ *
+ * Supported patterns (1-based line numbers, mirroring serialization_utils.py):
+ *   sed -i 'START,ENDc\n<replacement...>' <file>     -> editReplace
+ *   sed -i 'START,ENDd' <file>                      -> editDelete
+ *   sed -i 'STARTi\n<insert...>' <file>             -> editInsert (before START)
+ *   sed -i '$a\n<append...>' <file>                 -> editInsert (append at EOF)
+ *
+ * If the command does not match these patterns, returns undefined.
+ */
+function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): PlannedAction | undefined {
+	// Only consider the first command before && / ||, since cat -n etc. are for viewport only.
+	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
+	if (!main) {
+		return undefined;
+	}
+
+	// Match: sed -i '<script>' <file>
+	const sedMatch = main.match(/sed\s+-i\s+'([\s\S]*?)'\s+([^\s&|]+)\s*$/);
+	if (!sedMatch) {
+		return undefined;
+	}
+	const script = sedMatch[1] ?? '';
+	const targetFile = sedMatch[2] ?? '';
+	const activePath = doc.uri.fsPath;
+	// Be conservative: only apply edits when the sed target matches the active document path.
+	if (targetFile !== activePath) {
+		return undefined;
+	}
+
+	// Delete: "START,ENDd"
+	const deleteMatch = script.match(/^(\d+),(\d+)d$/);
+	if (deleteMatch) {
+		const startLine1 = Number(deleteMatch[1]);
+		const endLine1 = Number(deleteMatch[2]);
+		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
 			return undefined;
+		}
+		const startLine0 = Math.max(0, startLine1 - 1);
+		const endLine0 = Math.max(0, endLine1 - 1);
+
+		let endPosLine = endLine0 + 1;
+		let endPosChar = 0;
+		if (endPosLine >= doc.lineCount) {
+			endPosLine = doc.lineCount - 1;
+			endPosChar = doc.lineAt(endPosLine).range.end.character;
+		}
+		return {
+			kind: 'editDelete',
+			range: {
+				start: [startLine0, 0],
+				end: [endPosLine, endPosChar],
+			},
+		};
 	}
+
+	// Replace: "START,ENDc\newline<payload...>"
+	const replaceMatch = script.match(/^(\d+),(\d+)c\\\n([\s\S]*)$/);
+	if (replaceMatch) {
+		const startLine1 = Number(replaceMatch[1]);
+		const endLine1 = Number(replaceMatch[2]);
+		let payload = replaceMatch[3] ?? '';
+		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
+			return undefined;
+		}
+		// Unescape single quotes as done in _escape_single_quotes_for_sed.
+		payload = payload.replace(/'\"'\"'/g, "'");
+		const startLine0 = Math.max(0, startLine1 - 1);
+		const endLine0 = Math.max(0, endLine1 - 1);
+		const startPos: [number, number] = [startLine0, 0];
+
+		// Replace up to the start of the line after endLine, or end-of-document.
+		let endPosLine = endLine0 + 1;
+		let endPosChar = 0;
+		if (endPosLine >= doc.lineCount) {
+			endPosLine = doc.lineCount - 1;
+			endPosChar = doc.lineAt(endPosLine).range.end.character;
+		}
+
+		// Preserve multi-line payload as-is; append a trailing newline so sed-style replacements map naturally.
+		const text = payload.endsWith('\n') ? payload : payload + '\n';
+		return {
+			kind: 'editReplace',
+			range: { start: startPos, end: [endPosLine, endPosChar] },
+			text,
+		};
+	}
+
+	// Insert before a given line: "STARTi\newline<payload...>"
+	const insertMatch = script.match(/^(\d+)i\\\n([\s\S]*)$/);
+	if (insertMatch) {
+		const line1 = Number(insertMatch[1]);
+		let payload = insertMatch[2] ?? '';
+		if (!Number.isFinite(line1)) {
+			return undefined;
+		}
+		payload = payload.replace(/'\"'\"'/g, "'");
+		const insertLine0 = Math.max(0, line1 - 1);
+		const position: [number, number] = [insertLine0, 0];
+		const text = payload.endsWith('\n') ? payload : payload + '\n';
+		return {
+			kind: 'editInsert',
+			position,
+			text,
+		};
+	}
+
+	// Append at end of file: "$a\newline<payload...>"
+	const appendMatch = script.match(/^\$a\\\n([\s\S]*)$/);
+	if (appendMatch) {
+		let payload = appendMatch[1] ?? '';
+		payload = payload.replace(/'\"'\"'/g, "'");
+		const insertLine0 = doc.lineCount;
+		const position: [number, number] = [insertLine0, 0];
+		const needsLeadingNewline = doc.lineCount > 0;
+		const base = payload.endsWith('\n') ? payload : payload + '\n';
+		const text = needsLeadingNewline ? '\n' + base : base;
+		return {
+			kind: 'editInsert',
+			position,
+			text,
+		};
+	}
+
+	return undefined;
+}
+
+/**
+ * Parse viewport / selection commands of the form:
+ *   cat -n <file> | sed -n 'START,ENDp'
+ *
+ * into a lightweight VS Code selection move (setSelections). This mirrors how
+ * selection and viewport events are serialized in serialization_utils.py.
+ */
+function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument): PlannedAction | undefined {
+	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
+	if (!main) {
+		return undefined;
+	}
+
+	// Simple file-open: cat -n <file>
+	const simpleCatMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*$/);
+	if (simpleCatMatch) {
+		const targetFile = simpleCatMatch[1] ?? '';
+		if (targetFile !== doc.uri.fsPath) {
+			return undefined;
+		}
+		// Ensure the active document is visible; rely on existing editor to handle this.
+		return { kind: 'showTextDocument' };
+	}
+
+	// Viewport slice: cat -n <file> | sed -n 'START,ENDp'
+	const viewportMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*\|\s*sed\s+-n\s+'(\d+),(\d+)p'\s*$/);
+	if (!viewportMatch) {
+		return undefined;
+	}
+
+	const targetFile = viewportMatch[1] ?? '';
+	const startStr = viewportMatch[2] ?? '';
+	const endStr = viewportMatch[3] ?? '';
+
+	if (targetFile !== doc.uri.fsPath) {
+		return undefined;
+	}
+
+	const startLine1 = Number(startStr);
+	const endLine1 = Number(endStr);
+	if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
+		return undefined;
+	}
+
+	// Place the cursor in the middle of the viewport (1-based to 0-based).
+	const center1 = Math.floor((startLine1 + endLine1) / 2);
+	const center0 = Math.max(0, center1 - 1);
+	const lastLine = Math.max(0, doc.lineCount - 1);
+	const line = Math.min(center0, lastLine);
+	const endChar = doc.lineAt(line).range.end.character;
+
+	return {
+		kind: 'setSelections',
+		selections: [
+			{
+				start: [line, endChar],
+				end: [line, endChar],
+			},
+		],
+	};
+}
+
+function extractBashCommand(raw: string): string | undefined {
+	if (!raw) {
+		return undefined;
+	}
+	const trimmed = raw.trim();
+	const fenceMatch = trimmed.match(/```(?:bash)?\s*([\s\S]*?)```/i);
+	if (fenceMatch && fenceMatch[1]) {
+		return fenceMatch[1];
+	}
+	// Fallback: treat entire response as the command
+	return trimmed.length > 0 ? trimmed : undefined;
 }
