@@ -4,7 +4,7 @@ import * as http from 'http';
 import { Buffer } from 'buffer';
 
 
-const SGLANG_HOSTNAME = 'hai007';
+const SGLANG_HOSTNAME = 'hai001';
 const SGLANG_PORT = 30000;
 const SGLANG_BASE_PATH = '/v1/chat/completions';
 const SGLANG_MODEL_NAME = 'qwen/qwen3-0.6b';
@@ -16,11 +16,642 @@ const GEMINI_MODEL_NAME = 'gemini-2.5-flash';
 
 const USE_GEMINI = false;
 
+// -------------------- Serialization Helpers (mirrors serialization_utils.py) --------------------
+const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const ANSI_OSC_TERMINATED_RE = /\x1b\][\s\S]*?(?:\x07|\x1b\\)/g;
+const ANSI_OSC_LINE_FALLBACK_RE = /\x1b\][^\n]*$/g;
+
+// NOTE (f.srambical): Make sure that these are the parameters that were used during serialization
+const VIEWPORT_RADIUS = 10;
+const COALESCE_RADIUS = 5;
+
+function cleanText(text: string): string {
+	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
+}
+
+function fencedBlock(language: string | null, content: string): string {
+	const lang = (language || '').toLowerCase();
+	return `\`\`\`${lang}\n${content}\n\`\`\`\n`;
+}
+
+function applyChange(content: string, offset: number, length: number, newText: string): string {
+	let base = String(content);
+	const text = (newText ?? '').replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+	if (offset > base.length) {
+		base = base + ' '.repeat(offset - base.length);
+	}
+	return base.slice(0, offset) + text + base.slice(offset + length);
+}
+
+function applyBackspaces(text: string): string {
+	const out: string[] = [];
+	for (const ch of text) {
+		if (ch === '\b') {
+			if (out.length > 0) {
+				out.pop();
+			}
+		} else {
+			out.push(ch);
+		}
+	}
+	return out.join('');
+}
+
+function normalizeTerminalOutput(raw: string): string {
+	if (!raw) { return raw; }
+	let s = applyBackspaces(raw);
+	s = s.replace(ANSI_OSC_TERMINATED_RE, '');
+	s = s.split('\n').map(line => line.replace(ANSI_OSC_LINE_FALLBACK_RE, '')).join('\n');
+	const resolvedLines: string[] = [];
+	for (const seg of s.split('\n')) {
+		const parts = seg.split('\r');
+		let chosen = '';
+		for (let i = parts.length - 1; i >= 0; i--) {
+			if (parts[i] !== '') {
+				chosen = parts[i];
+				break;
+			}
+		}
+		if (chosen === '' && parts.length > 0) {
+			chosen = parts[parts.length - 1];
+		}
+		resolvedLines.push(chosen);
+	}
+	s = resolvedLines.join('\n');
+	s = s.replace(ANSI_CSI_RE, '');
+	s = s.replace(/\x07/g, '');
+	return s;
+}
+
+function lineNumberedOutput(content: string, startLine?: number, endLine?: number): string {
+	const lines = content.split(/\r?\n/);
+	const total = (lines.length === 1 && lines[0] === '') ? 0 : lines.length;
+	if (total === 0) { return ''; }
+	const s = startLine !== undefined ? Math.max(1, Math.min(startLine, total)) : 1;
+	const e = endLine !== undefined ? Math.max(1, Math.min(endLine, total)) : total;
+	const buf: string[] = [];
+	for (let idx = s; idx <= e; idx++) {
+		const lineText = lines[idx - 1] ?? '';
+		buf.push(`${idx.toString().padStart(6, ' ')}\t${lineText}`);
+	}
+	return buf.join('\n');
+}
+
+function serializeComputeViewport(totalLines: number, centerLine: number, radius: number): { start: number; end: number } {
+	if (totalLines <= 0) { return { start: 1, end: 0 }; }
+	const start = Math.max(1, centerLine - radius);
+	const end = Math.min(totalLines, centerLine + radius);
+	return { start, end };
+}
+
+function escapeSingleQuotesForSed(text: string): string {
+	return text.replace(/'/g, "'\"'\"'");
+}
+
+type OpcodeTag = "replace" | "delete" | "insert" | "equal";
+
+type Opcode = [OpcodeTag, number, number, number, number];
+
+class SequenceMatcher {
+	private a: string[];
+	private b: string[];
+	private b2j: Map<string, number[]> | null = null;
+	private matchingBlocks: Array<{ i: number; j: number; n: number }> | null = null;
+	private opcodesCache: Opcode[] | null = null;
+
+	constructor(a: string[], b: string[]) {
+		this.a = a;
+		this.b = b;
+		this.chainB();
+	}
+
+	// Exact port of difflib's __chain_b assuming junk=None and autojunk=False
+	private chainB() {
+		this.b2j = new Map();
+		for (let i = 0; i < this.b.length; i++) {
+			const elt = this.b[i];
+			let indices = this.b2j.get(elt);
+			if (!indices) {
+				indices = [];
+				this.b2j.set(elt, indices);
+			}
+			indices.push(i);
+		}
+	}
+
+	// Exact port of difflib's find_longest_match assuming junk=None
+	private findLongestMatch(alo: number, ahi: number, blo: number, bhi: number) {
+		const b2j = this.b2j!;
+
+		let besti = alo;
+		let bestj = blo;
+		let bestsize = 0;
+
+		let j2len = new Map<number, number>();
+
+		for (let i = alo; i < ahi; i++) {
+			const newj2len = new Map<number, number>();
+			const elt = this.a[i];
+			const indices = b2j.get(elt);
+			if (indices) {
+				for (const j of indices) {
+					if (j < blo) { continue; }
+					if (j >= bhi) { break; }
+					const k = (j2len.get(j - 1) ?? 0) + 1;
+					newj2len.set(j, k);
+					if (k > bestsize) {
+						besti = i - k + 1;
+						bestj = j - k + 1;
+						bestsize = k;
+					}
+				}
+			}
+			j2len = newj2len;
+		}
+
+		// bjunk is always empty since we assume junk=None
+		while (besti > alo && bestj > blo && this.a[besti - 1] === this.b[bestj - 1]) {
+			besti--;
+			bestj--;
+			bestsize++;
+		}
+		while (
+			besti + bestsize < ahi &&
+			bestj + bestsize < bhi &&
+			this.a[besti + bestsize] === this.b[bestj + bestsize]
+		) {
+			bestsize++;
+		}
+
+		return { i: besti, j: bestj, n: bestsize };
+	}
+
+	// Exact port of difflib's get_matching_blocks
+	private getMatchingBlocks() {
+		if (this.matchingBlocks !== null) { return this.matchingBlocks; }
+
+		const la = this.a.length;
+		const lb = this.b.length;
+
+		const queue: Array<[number, number, number, number]> = [[0, la, 0, lb]];
+		const matchingBlocks: Array<{ i: number; j: number; n: number }> = [];
+
+		while (queue.length) {
+			const [alo, ahi, blo, bhi] = queue.pop()!;
+			const match = this.findLongestMatch(alo, ahi, blo, bhi);
+			const { i, j, n } = match;
+			if (n > 0) {
+				matchingBlocks.push(match);
+				if (alo < i && blo < j) {
+					queue.push([alo, i, blo, j]);
+				}
+				if (i + n < ahi && j + n < bhi) {
+					queue.push([i + n, ahi, j + n, bhi]);
+				}
+			}
+		}
+
+		// Sort lexicographically by (i, j, n) to match Python's tuple sort behavior
+		matchingBlocks.sort((a, b) => {
+			if (a.i !== b.i) { return a.i - b.i; }
+			if (a.j !== b.j) { return a.j - b.j; }
+			return a.n - b.n;
+		});
+
+		let i1 = 0;
+		let j1 = 0;
+		let k1 = 0;
+		const result: Array<{ i: number; j: number; n: number }> = [];
+
+		for (const m of matchingBlocks) {
+			if (i1 + k1 === m.i && j1 + k1 === m.j) {
+				k1 += m.n;
+			} else {
+				if (k1 > 0) {
+					result.push({ i: i1, j: j1, n: k1 });
+				}
+				i1 = m.i;
+				j1 = m.j;
+				k1 = m.n;
+			}
+		}
+		if (k1 > 0) {
+			result.push({ i: i1, j: j1, n: k1 });
+		}
+
+		result.push({ i: la, j: lb, n: 0 });
+
+		this.matchingBlocks = result;
+		return result;
+	}
+
+	// Exact port of difflib's get_opcodes
+	getOpcodes(): Opcode[] {
+		if (this.opcodesCache) { return this.opcodesCache; }
+
+		const opcodes: Opcode[] = [];
+		let i = 0;
+		let j = 0;
+
+		for (const m of this.getMatchingBlocks()) {
+			const tag: OpcodeTag = "equal";
+			const ai = m.i;
+			const bj = m.j;
+			const n = m.n;
+
+			let tagToUse: OpcodeTag | null = null;
+
+			if (i < ai && j < bj) {
+				tagToUse = "replace";
+			} else if (i < ai) {
+				tagToUse = "delete";
+			} else if (j < bj) {
+				tagToUse = "insert";
+			}
+
+			if (tagToUse) {
+				opcodes.push([tagToUse, i, ai, j, bj]);
+			}
+			if (n > 0) {
+				opcodes.push([tag, ai, ai + n, bj, bj + n]);
+			}
+			i = ai + n;
+			j = bj + n;
+		}
+
+		this.opcodesCache = opcodes;
+		return opcodes;
+	}
+}
+
+
+export function computeChangedBlockLines(before: string, after: string): {
+	startBefore: number;
+	endBefore: number;
+	startAfter: number;
+	endAfter: number;
+	replacementLines: string[];
+} {
+	const beforeLines = before.split(/\r?\n/);
+	const afterLines = after.split(/\r?\n/);
+
+	const sm = new SequenceMatcher(beforeLines, afterLines);
+	const allOpcodes = sm.getOpcodes();
+	const nonEqual = allOpcodes.filter(op => op[0] !== "equal");
+
+	if (nonEqual.length === 0) {
+		throw new Error(
+			"Opcode list cannot be empty! Likely a bug in the diff computation."
+		);
+	}
+
+	const first = nonEqual[0];
+	const last = nonEqual[nonEqual.length - 1];
+
+	// i1/i2 refer to 'before' indices, j1/j2 to 'after'
+	const startBefore = Math.max(1, first[1] + 1);
+	const endBefore = last[2];
+	const startAfter = Math.max(1, first[3] + 1);
+	const endAfter = last[4];
+	const replacementLines = afterLines.slice(first[3], last[4]);
+
+	return { startBefore, endBefore, startAfter, endAfter, replacementLines };
+}
+// -------------------- Conversation State Manager --------------------
+interface ConversationMessage {
+	from: 'User' | 'Assistant';
+	value: string;
+}
+
+class ConversationStateManager {
+	private messages: ConversationMessage[] = [];
+	private fileStates: Map<string, string> = new Map();
+	private perFileViewport: Map<string, { start: number; end: number } | null> = new Map();
+	private filesOpenedInConversation: Set<string> = new Set();
+	private terminalOutputBuffer: string[] = [];
+	private pendingEditsBefore: Map<string, string | null> = new Map();
+	private pendingEditRegions: Map<string, { start: number; end: number } | null> = new Map();
+
+	constructor() {}
+
+	reset(): void {
+		this.messages = [];
+		this.fileStates.clear();
+		this.perFileViewport.clear();
+		this.filesOpenedInConversation.clear();
+		this.terminalOutputBuffer = [];
+		this.pendingEditsBefore.clear();
+		this.pendingEditRegions.clear();
+	}
+
+	getMessages(): ConversationMessage[] {
+		return [...this.messages];
+	}
+
+	getFileContent(filePath: string): string {
+		return this.fileStates.get(filePath) ?? '';
+	}
+
+	private appendMessage(message: ConversationMessage): void {
+		this.messages.push(message);
+	}
+
+	private maybeCaptureFileContents(filePath: string, content: string): void {
+		if (this.filesOpenedInConversation.has(filePath)) {
+			return;
+		}
+		const cmd = `cat -n ${filePath}`;
+		this.appendMessage({
+			from: 'Assistant',
+			value: fencedBlock('bash', cleanText(cmd)),
+		});
+		const output = lineNumberedOutput(content);
+		this.appendMessage({
+			from: 'User',
+			value: `<stdout>\n${output}\n</stdout>`,
+		});
+		this.filesOpenedInConversation.add(filePath);
+	}
+
+	flushTerminalOutputBuffer(): void {
+		if (this.terminalOutputBuffer.length === 0) {
+			return;
+		}
+		const aggregated = this.terminalOutputBuffer.join('');
+		const out = normalizeTerminalOutput(aggregated);
+		const cleaned = cleanText(out);
+		if (cleaned.trim()) {
+			this.appendMessage({
+				from: 'User',
+				value: `<stdout>\n${cleaned}\n</stdout>`,
+			});
+		}
+		this.terminalOutputBuffer = [];
+	}
+
+	flushPendingEditForFile(targetFile: string): void {
+		const beforeSnapshot = this.pendingEditsBefore.get(targetFile);
+		if (beforeSnapshot === null || beforeSnapshot === undefined) {
+			return;
+		}
+		const afterState = this.fileStates.get(targetFile) ?? '';
+		if (beforeSnapshot.replace(/\n+$/, '') === afterState.replace(/\n+$/, '')) {
+			this.pendingEditsBefore.set(targetFile, null);
+			this.pendingEditRegions.set(targetFile, null);
+			return;
+		}
+
+		const {
+			startBefore,
+			endBefore,
+			startAfter,
+			endAfter,
+			replacementLines,
+		} = computeChangedBlockLines(beforeSnapshot, afterState);
+
+		const beforeTotalLines = beforeSnapshot.split(/\r?\n/).length;
+		let sedCmd: string;
+
+		if (endBefore < startBefore) {
+			// Pure insertion
+			const escapedLines = replacementLines.map(line => escapeSingleQuotesForSed(line));
+			const sedPayload = escapedLines.join('\n');
+			if (startBefore <= Math.max(1, beforeTotalLines)) {
+				sedCmd = `sed -i '${startBefore}i\\\n${sedPayload}' ${targetFile}`;
+			} else {
+				sedCmd = `sed -i '$a\\\n${sedPayload}' ${targetFile}`;
+			}
+		} else if (replacementLines.length === 0) {
+			// Pure deletion
+			sedCmd = `sed -i '${startBefore},${endBefore}d' ${targetFile}`;
+		} else {
+			// Replacement
+			const escapedLines = replacementLines.map(line => escapeSingleQuotesForSed(line));
+			const sedPayload = escapedLines.join('\n');
+			sedCmd = `sed -i '${startBefore},${endBefore}c\\\n${sedPayload}' ${targetFile}`;
+		}
+
+		const totalLines = afterState.split(/\r?\n/).length;
+		const center = Math.floor((startAfter + endAfter) / 2);
+		const vp = serializeComputeViewport(totalLines, center, VIEWPORT_RADIUS);
+		this.perFileViewport.set(targetFile, vp);
+
+		this.maybeCaptureFileContents(targetFile, beforeSnapshot);
+
+		const chainedCmd = `${sedCmd} && cat -n ${targetFile} | sed -n '${vp.start},${vp.end}p'`;
+		this.appendMessage({
+			from: 'Assistant',
+			value: fencedBlock('bash', cleanText(chainedCmd)),
+		});
+
+		const viewportOutput = lineNumberedOutput(afterState, vp.start, vp.end);
+		this.appendMessage({
+			from: 'User',
+			value: `<stdout>\n${viewportOutput}\n</stdout>`,
+		});
+
+		this.pendingEditsBefore.set(targetFile, null);
+		this.pendingEditRegions.set(targetFile, null);
+	}
+
+	flushAllPendingEdits(): void {
+		for (const fname of this.pendingEditsBefore.keys()) {
+			this.flushPendingEditForFile(fname);
+		}
+	}
+
+	handleTabEvent(filePath: string, textContent: string | null): void {
+		this.flushAllPendingEdits();
+		this.flushTerminalOutputBuffer();
+
+		if (textContent !== null) {
+			const content = textContent.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+			this.fileStates.set(filePath, content);
+
+			const cmd = `cat -n ${filePath}`;
+			this.appendMessage({
+				from: 'Assistant',
+				value: fencedBlock('bash', cleanText(cmd)),
+			});
+			const output = lineNumberedOutput(content);
+			this.appendMessage({
+				from: 'User',
+				value: `<stdout>\n${output}\n</stdout>`,
+			});
+			this.filesOpenedInConversation.add(filePath);
+		} else {
+			// File switch without content snapshot: show current viewport only
+			const content = this.fileStates.get(filePath) ?? '';
+			const totalLines = content.split(/\r?\n/).length;
+			let vp = this.perFileViewport.get(filePath);
+			if (!vp || vp.end === 0) {
+				vp = serializeComputeViewport(totalLines, 1, VIEWPORT_RADIUS);
+				this.perFileViewport.set(filePath, vp);
+			}
+			if (vp && vp.end >= vp.start) {
+				this.maybeCaptureFileContents(filePath, content);
+				const cmd = `cat -n ${filePath} | sed -n '${vp.start},${vp.end}p'`;
+				this.appendMessage({
+					from: 'Assistant',
+					value: fencedBlock('bash', cleanText(cmd)),
+				});
+				const viewportOutput = lineNumberedOutput(content, vp.start, vp.end);
+				this.appendMessage({
+					from: 'User',
+					value: `<stdout>\n${viewportOutput}\n</stdout>`,
+				});
+			}
+		}
+	}
+
+	handleContentEvent(filePath: string, offset: number, length: number, newText: string): void {
+		this.flushTerminalOutputBuffer();
+
+		const before = this.fileStates.get(filePath) ?? '';
+		const newTextStr = newText ?? '';
+
+		// Approximate current edit region in line space
+		const startLineCurrent = before.slice(0, offset).split('\n').length;
+		const deletedContent = before.slice(offset, offset + length);
+		const linesAdded = (newTextStr.match(/\n/g) || []).length;
+		const linesDeleted = (deletedContent.match(/\n/g) || []).length;
+		const regionStart = startLineCurrent;
+		const regionEnd = startLineCurrent + Math.max(linesAdded, linesDeleted, 0);
+
+		// Flush pending edits if this edit is far from the pending region
+		let currentRegion = this.pendingEditRegions.get(filePath);
+		if (currentRegion !== null && currentRegion !== undefined) {
+			const { start: rstart, end: rend } = currentRegion;
+			if (regionStart < (rstart - COALESCE_RADIUS) || regionStart > (rend + COALESCE_RADIUS)) {
+				this.flushPendingEditForFile(filePath);
+				currentRegion = null;
+			}
+		}
+
+		const after = applyChange(before, offset, length, newText);
+
+		if (this.pendingEditsBefore.get(filePath) === null || this.pendingEditsBefore.get(filePath) === undefined) {
+			this.pendingEditsBefore.set(filePath, before);
+		}
+
+		// Update/initialize region union
+		if (currentRegion === null || currentRegion === undefined) {
+			this.pendingEditRegions.set(filePath, { start: regionStart, end: Math.max(regionStart, regionEnd) });
+		} else {
+			const { start: rstart, end: rend } = currentRegion;
+			this.pendingEditRegions.set(filePath, {
+				start: Math.min(rstart, regionStart),
+				end: Math.max(rend, regionEnd),
+			});
+		}
+
+		this.fileStates.set(filePath, after);
+	}
+
+	handleSelectionEvent(filePath: string, offset: number): void {
+		if (this.pendingEditsBefore.get(filePath) !== null && this.pendingEditsBefore.get(filePath) !== undefined) {
+			return;
+		}
+
+		this.flushTerminalOutputBuffer();
+
+		const content = this.fileStates.get(filePath) ?? '';
+		const totalLines = content.split(/\r?\n/).length;
+		const targetLine = content.slice(0, offset).split('\n').length;
+
+		let vp = this.perFileViewport.get(filePath);
+		let shouldEmit = false;
+
+		if (!vp || vp.end === 0) {
+			vp = serializeComputeViewport(totalLines, targetLine, VIEWPORT_RADIUS);
+			this.perFileViewport.set(filePath, vp);
+			shouldEmit = true;
+		} else {
+			if (targetLine < vp.start || targetLine > vp.end) {
+				vp = serializeComputeViewport(totalLines, targetLine, VIEWPORT_RADIUS);
+				this.perFileViewport.set(filePath, vp);
+				shouldEmit = true;
+			}
+		}
+
+		if (shouldEmit && vp && vp.end >= vp.start) {
+			this.maybeCaptureFileContents(filePath, content);
+			const cmd = `cat -n ${filePath} | sed -n '${vp.start},${vp.end}p'`;
+			this.appendMessage({
+				from: 'Assistant',
+				value: fencedBlock('bash', cleanText(cmd)),
+			});
+			const viewportOutput = lineNumberedOutput(content, vp.start, vp.end);
+			this.appendMessage({
+				from: 'User',
+				value: `<stdout>\n${viewportOutput}\n</stdout>`,
+			});
+		}
+	}
+
+	handleTerminalCommandEvent(command: string): void {
+		this.flushAllPendingEdits();
+		this.flushTerminalOutputBuffer();
+
+		const commandStr = command.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+		this.appendMessage({
+			from: 'Assistant',
+			value: fencedBlock('bash', cleanText(commandStr)),
+		});
+	}
+
+	handleTerminalOutputEvent(output: string): void {
+		const rawOutput = output.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+		this.terminalOutputBuffer.push(rawOutput);
+	}
+
+	handleTerminalFocusEvent(): void {
+		this.flushAllPendingEdits();
+		this.flushTerminalOutputBuffer();
+		// No-op for bash transcript; focus changes don't emit commands/output
+	}
+
+	handleGitBranchCheckoutEvent(branchInfo: string): void {
+		this.flushAllPendingEdits();
+		this.flushTerminalOutputBuffer();
+
+		const branchStr = branchInfo.replace(/\\n/g, '\n').replace(/\\r/g, '\r');
+		const cleaned = cleanText(branchStr);
+		const m = cleaned.match(/to '([^']+)'/);
+		if (!m) {
+			console.warn(`[crowd-pilot] Could not extract branch name from git checkout message: ${cleaned}`);
+			return;
+		}
+		let branchName = m[1].trim();
+		// Safe-quote branch if it contains special characters
+		if (/[^A-Za-z0-9._/\\-]/.test(branchName)) {
+			branchName = "'" + branchName.replace(/'/g, "'\"'\"'") + "'";
+		}
+		const cmd = `git checkout ${branchName}`;
+		this.appendMessage({
+			from: 'Assistant',
+			value: fencedBlock('bash', cleanText(cmd)),
+		});
+	}
+
+	// Finalize and get conversation ready for model
+	finalizeForModel(): ConversationMessage[] {
+		this.flushAllPendingEdits();
+		this.flushTerminalOutputBuffer();
+		return this.getMessages();
+	}
+}
+
+// Global conversation state manager instance
+const conversationManager = new ConversationStateManager();
+
+// Track activated files (files whose content we've captured)
+const activatedFiles = new Set<string>();
+
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
 
-	// Configure terminal to allow tab keybinding to work
 	(async () => {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
 		const commandsToSkipShell = config.get<string[]>('commandsToSkipShell', []);
@@ -48,7 +679,6 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		try {
-			// Confirm only when a suggestion is visible
 			if (!previewVisible) { return; }
 			let action: PlannedAction | undefined = currentAction;
 			if (!action) {
@@ -78,28 +708,93 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	// Auto-preview listeners
-	const debouncedAutoPreview = debounce(() => {
-		autoShowNextAction();
-	}, 250);
 	const onSelChange = vscode.window.onDidChangeTextEditorSelection((e) => {
 		if (e.textEditor === vscode.window.activeTextEditor) {
 			suppressAutoPreview = false;
-			debouncedAutoPreview();
-		}
-	});
-	const onActiveChange = vscode.window.onDidChangeActiveTextEditor(() => {
-		suppressAutoPreview = false;
-		debouncedAutoPreview();
-	});
-	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
-		if (vscode.window.activeTextEditor?.document === e.document) {
-			suppressAutoPreview = false;
-			debouncedAutoPreview();
+			schedulePredictionRefresh(true, false);
+
+			const editor = e.textEditor;
+			const selection = e.selections[0];
+			if (selection) {
+				const filePath = editor.document.uri.fsPath;
+				const offset = editor.document.offsetAt(selection.start);
+				conversationManager.handleSelectionEvent(filePath, offset);
+			}
 		}
 	});
 
-	context.subscriptions.push(hideUi, sglangTest, modelRun, onSelChange, onActiveChange, onDocChange);
+	const onActiveChange = vscode.window.onDidChangeActiveTextEditor((editor) => {
+		suppressAutoPreview = false;
+		schedulePredictionRefresh(true, false);
+
+		if (editor) {
+			const filePath = editor.document.uri.fsPath;
+			const currentFileUri = editor.document.uri.toString();
+			let tabEventText: string | null = null;
+
+			if (!activatedFiles.has(currentFileUri)) {
+				tabEventText = editor.document.getText();
+				activatedFiles.add(currentFileUri);
+			}
+
+			conversationManager.handleTabEvent(filePath, tabEventText);
+		}
+	});
+
+	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
+		if (vscode.window.activeTextEditor?.document === e.document) {
+			suppressAutoPreview = false;
+			schedulePredictionRefresh(true, false);
+
+			const filePath = e.document.uri.fsPath;
+			for (const change of e.contentChanges) {
+				const offset = change.rangeOffset;
+				const length = change.rangeLength;
+				const newText = change.text;
+				conversationManager.handleContentEvent(filePath, offset, length, newText);
+			}
+		}
+	});
+
+	// Terminal focus event
+	const onTerminalChange = vscode.window.onDidChangeActiveTerminal((terminal) => {
+		if (terminal) {
+			conversationManager.handleTerminalFocusEvent();
+		}
+	});
+
+	// Terminal command execution event
+	const onTerminalCommand = vscode.window.onDidStartTerminalShellExecution(async (event) => {
+		const commandLine = event.execution.commandLine.value;
+		conversationManager.handleTerminalCommandEvent(commandLine);
+
+		// Capture terminal output
+		const stream = event.execution.read();
+		for await (const data of stream) {
+			conversationManager.handleTerminalOutputEvent(data);
+		}
+	});
+
+	context.subscriptions.push(
+		hideUi,
+		sglangTest,
+		modelRun,
+		onSelChange,
+		onActiveChange,
+		onDocChange,
+		onTerminalChange,
+		onTerminalCommand
+	);
+
+	// Initialize: capture current active editor if any
+	const initialEditor = vscode.window.activeTextEditor;
+	if (initialEditor) {
+		const filePath = initialEditor.document.uri.fsPath;
+		const currentFileUri = initialEditor.document.uri.toString();
+		const tabEventText = initialEditor.document.getText();
+		activatedFiles.add(currentFileUri);
+		conversationManager.handleTabEvent(filePath, tabEventText);
+	}
 }
 
 export function deactivate() {}
@@ -176,6 +871,16 @@ let suppressAutoPreview = false;
 let latestRequestId = 0;
 let currentAbortController: AbortController | undefined;
 
+const PREDICTION_DEBOUNCE_MS = 150;
+const PREDICTION_THROTTLE_MS = 300;
+
+type PendingPrediction = { id: number; timer: NodeJS.Timeout };
+
+let nextQueuedPredictionId = 0;
+let pendingPredictions: PendingPrediction[] = [];
+const cancelledPredictionIds = new Set<number>();
+let lastPredictionTimestamp: number | undefined;
+
 function disposePreviewDecorations() {
 	try { decorationDeleteType?.dispose(); } catch {}
 	try { decorationReplaceType?.dispose(); } catch {}
@@ -185,16 +890,7 @@ function disposePreviewDecorations() {
 	decorationReplaceBlockType = undefined;
 }
 
-function debounce<T extends (...args: any[]) => void>(fn: T, waitMs: number) {
-	let timer: NodeJS.Timeout | undefined;
-	return (...args: Parameters<T>) => {
-		if (timer) { clearTimeout(timer); }
-		timer = setTimeout(() => fn(...args), waitMs);
-	};
-}
-
 function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: string): string {
-	// Count lines in the preview text
 	const lines = text.split(/\r?\n/);
 	const height = lines.length;
 	
@@ -211,27 +907,16 @@ function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: s
 	
 	for (let i = startLine; i <= endLine; i++) {
 		const lineText = doc.lineAt(i).text;
-		// Simple approximation: assume tabs are 4 spaces if we can't get config easily, 
-		// or just treat them as 1 char (which might underestimate). 
-		// Better to overestimate: treat tab as 4 chars.
 		const len = lineText.replace(/\t/g, '    ').length;
 		if (len > maxLen) {
 			maxLen = len;
 		}
 	}
 	
-	// Length of the anchor line itself
 	const anchorLineText = doc.lineAt(anchorLine).text;
 	const anchorLen = anchorLineText.replace(/\t/g, '    ').length;
 	
-	// The offset needed is maxLen - anchorLen.
-	// If maxLen <= anchorLen, offset is 0 (margin is just base padding).
-	// If maxLen > anchorLen, we need to push right by (maxLen - anchorLen).
-	
 	const diff = Math.max(0, maxLen - anchorLen);
-	// Base margin 2rem is roughly 4ch. Let's use ch units for everything to be consistent.
-	// 1ch is width of '0'. In monospace, mostly consistent.
-	// Add 3ch extra padding for safety/visual gap.
 	const margin = diff + 4; 
 	return `${margin}ch`;
 }
@@ -256,10 +941,8 @@ function showPreviewUI(action: PlannedAction): void {
 	};
 
 	if (next.kind === 'setSelections') {
-		// For setSelections, we only preview the primary selection's start/active position
 		const selection = next.selections[0];
 		const targetPos = new vscode.Position(selection.start[0], selection.start[1]);
-		// Check if the target position is visible
 		const isVisible = editor.visibleRanges.some(r => r.contains(targetPos));
 		
 		let anchorPos = targetPos;
@@ -323,31 +1006,21 @@ function showPreviewUI(action: PlannedAction): void {
 			.replace(/\r?\n/g, '\\A ');
 
 		const docLineCount = editor.document.lineCount;
-		// If inserting at EOF (or beyond), attach to the last line.
-		// Otherwise, attach to the line AT the insertion point and shift visually UP into the gap.
 		let anchorLine = posLine;
 		let shiftUp = true;
 		
 		if (anchorLine >= docLineCount) {
 			anchorLine = docLineCount - 1;
-			shiftUp = false; // At EOF, we just append below or to the right
+			shiftUp = false;
 		}
 
 		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE); 
 		
-		// We attach to the line AT the insertion point.
-		// The panel floats to the right of this line.
-		// The dashed line connects the start of this line to the panel.
-		// This indicates that the new text will be inserted at this line position (pushing the current line down).
 		const marginCheckLine = anchorLine;
 		const margin = getDynamicMargin(editor, marginCheckLine, fullBlock);
 
 		const topOffset = '0';
 
-		// Dashed line style
-		// We use 'before' decoration for the line.
-		// It needs to be absolute, full width (or enough to reach left), 
-		// and aligned with the panel top.
 		const beforeDecoration = {
 			contentText: '',
 			textDecoration: `none; position: absolute; left: 0; width: 100vw; border-top: 1px dashed var(--vscode-charts-purple); top: 0; height: 0; z-index: 99; pointer-events: none;`
@@ -382,7 +1055,6 @@ function showPreviewUI(action: PlannedAction): void {
 			new vscode.Position(next.range.start[0], next.range.start[1]),
 			new vscode.Position(next.range.end[0], next.range.end[1])
 		);
-		// Highlight original range (to be replaced)
 		decorationReplaceType = vscode.window.createTextEditorDecorationType({
 			backgroundColor: 'rgba(255,165,0,0.15)',
 			border: '1px dashed rgba(255,165,0,0.45)',
@@ -391,25 +1063,19 @@ function showPreviewUI(action: PlannedAction): void {
 		});
 		editor.setDecorations(decorationReplaceType, [{ range }]);
 
-		// Show replacement block to the right of the first replaced line
 		const fullBlock = next.text;
 		
-		// CSS-escape the text for the 'content' property:
-		// - Escape double quotes
-		// - Replace newlines with \A (CSS newline)
 		const cssContent = fullBlock
 			.replace(/"/g, '\\"')
 			.replace(/\r?\n/g, '\\A '); 
 
-		// Attach 'after' decoration to the start of the replacement range
-		// (Actually, attaching to the end of the first line is safer for 'after')
 		const anchorLine = range.start.line;
 		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE);
 		const margin = getDynamicMargin(editor, anchorLine, fullBlock);
 
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
-				contentText: '', // Handled by CSS content
+				contentText: '',
 				color: new vscode.ThemeColor('charts.purple'),
 				backgroundColor: new vscode.ThemeColor('editor.background'),
 				fontStyle: 'italic',
@@ -435,77 +1101,67 @@ function hidePreviewUI(suppress?: boolean): void {
 	}
 }
 
-// -------------------- Hardcoded single-step actions --------------------
-function getHardcodedNextAction(editor: vscode.TextEditor): PlannedAction | undefined {
-	const cursor = editor.selection.active;
-	const doc = editor.document;
-	const lineCount = doc.lineCount;
-	const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+/**
+ * Schedule a model preview refresh, coalescing rapid editor events and
+ * throttling how often we actually talk to the model.
+ */
+function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): void {
+	if (!userRequested && suppressAutoPreview) {
+		return;
+	}
 
-	// Step 0: Insert multiline content two lines below the cursor (start of target line)
-	if (mockStep === 0) {
-		const targetLine = clamp(cursor.line + 2, 0, Math.max(0, lineCount - 1));
-		return {
-			kind: 'editInsert',
-			position: [targetLine, 0],
-			text: '/* crowd-pilot: insert start */\nline A\nline B\n/* crowd-pilot: insert end */\n'
-		};
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		hidePreviewUI();
+		return;
 	}
-	// Step 1: Replace a two-line range three and four lines below the cursor
-	if (mockStep === 1) {
-		const startLine = clamp(cursor.line + 3, 0, Math.max(0, lineCount - 1));
-		const endLine = clamp(startLine + 1, 0, Math.max(0, lineCount - 1));
-		const endChar = doc.lineAt(endLine).range.end.character;
-		const range = {
-			start: [startLine, 0] as [number, number],
-			end: [endLine, endChar] as [number, number]
-		};
-		const replacement = [
-			'/* crowd-pilot: replacement */',
-			'REPLACED LINE 1',
-			'REPLACED LINE 2'
-		].join('\n');
-		return { kind: 'editReplace', range, text: replacement };
+
+	if (!userRequested) {
+		if (!vscode.window.state.focused) {
+			hidePreviewUI();
+			return;
+		}
+		if (editor.document.getText().length === 0) {
+			hidePreviewUI();
+			return;
+		}
 	}
-	// Step 2: Delete a three-line range six to eight lines below the cursor
-	if (mockStep === 2) {
-		const startLine = clamp(cursor.line + 6, 0, Math.max(0, lineCount - 1));
-		const endLine = clamp(startLine + 2, 0, Math.max(0, lineCount - 1));
-		
-		// To fully delete the lines including the newline, we target the start of the next line.
-		let endPosLine = endLine + 1;
-		let endPosChar = 0;
-		
-		if (endPosLine >= lineCount) {
-			// If deleting the last line(s), just go to the end of the document
-			endPosLine = lineCount - 1;
-			endPosChar = doc.lineAt(endPosLine).range.end.character;
+
+	const now = Date.now();
+	const id = ++nextQueuedPredictionId;
+
+	let delay = 0;
+	if (debounce) {
+		delay = Math.max(delay, PREDICTION_DEBOUNCE_MS);
+	}
+	if (lastPredictionTimestamp !== null && lastPredictionTimestamp !== undefined) {
+		const elapsed = now - lastPredictionTimestamp;
+		if (elapsed < PREDICTION_THROTTLE_MS) {
+			delay = Math.max(delay, PREDICTION_THROTTLE_MS - elapsed);
+		}
+	}
+
+	const timer = setTimeout(() => {
+		if (cancelledPredictionIds.has(id)) {
+			cancelledPredictionIds.delete(id);
+			return;
 		}
 
-		const range = {
-			start: [startLine, 0] as [number, number],
-			end: [endPosLine, endPosChar] as [number, number]
-		};
-		return { kind: 'editDelete', range };
-	}
-	// Step 3: Execute in Terminal
-	if (mockStep === 3) {
-		return { kind: 'terminalSendText', text: 'echo "Hello World"' };
-	}
-	// Step 4: Move Cursor to End of File
-	if (mockStep === 4) {
-		const lastLine = doc.lineCount - 1;
-		const lastChar = doc.lineAt(lastLine).range.end.character;
-		return {
-			kind: 'setSelections',
-			selections: [{ start: [lastLine, lastChar], end: [lastLine, lastChar] }]
-		};
-	}
-	return undefined;
-}
+		lastPredictionTimestamp = Date.now();
+		pendingPredictions = pendingPredictions.filter(p => p.id !== id);
 
-function advanceMockStep(): void {
-	mockStep = (mockStep + 1) % 5;
+		void autoShowNextAction();
+	}, delay);
+
+	pendingPredictions.push({ id, timer });
+
+	if (pendingPredictions.length > 2) {
+		const oldest = pendingPredictions.shift();
+		if (oldest) {
+			cancelledPredictionIds.add(oldest.id);
+			clearTimeout(oldest.timer);
+		}
+	}
 }
 
 async function autoShowNextAction(): Promise<void> {
@@ -623,42 +1279,6 @@ async function callSGLangChat(): Promise<void> {
 	}
 }
 
-// -------------------- Prompt Serialization Helpers --------------------
-function formatStdoutBlock(content: string): string {
-	const normalized = content ?? '';
-	return `<stdout>\n${normalized}\n</stdout>`;
-}
-
-function formatLineNumberedOutput(content: string, startLine?: number, endLine?: number): string {
-	const lines = content.split(/\r?\n/);
-	const total = (lines.length === 1 && lines[0] === '') ? 0 : lines.length;
-	if (total === 0) {
-		return '';
-	}
-	const s = startLine !== undefined ? Math.max(1, Math.min(startLine, total)) : 1;
-	const e = endLine !== undefined ? Math.max(s, Math.min(endLine, total)) : total;
-	const buf: string[] = [];
-	for (let idx = s; idx <= e; idx++) {
-		const lineText = lines[idx - 1] ?? '';
-		buf.push(`${idx.toString().padStart(6, ' ')}\t${lineText}`);
-	}
-	return buf.join('\n');
-}
-
-function computeViewport(totalLines: number, centerLine: number, radius: number): { start: number; end: number } {
-	if (totalLines <= 0) {
-		return { start: 1, end: 0 };
-	}
-	const start = Math.max(1, centerLine - radius);
-	const end = Math.min(totalLines, centerLine + radius);
-	return { start, end };
-}
-
-function fencedBashBlock(command: string): string {
-	const cleaned = command.replace(/\r/g, '').trim();
-	return `\`\`\`bash\n${cleaned}\n\`\`\``;
-}
-
 // -------------------- Model-planned Actions --------------------
 async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<PlannedAction> {
 	const config = vscode.workspace.getConfiguration();
@@ -694,26 +1314,8 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	}
 
 	const doc = editor.document;
-	const cursor = editor.selection.active;
-	const fullText = doc.getText();
-	const filePath = doc.uri.fsPath;
-	const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '(unknown)';
-	const cursorLine = cursor.line + 1;
-	const cursorColumn = cursor.character + 1;
-	const totalLines = doc.lineCount;
-	const viewport = computeViewport(totalLines, cursorLine, 12);
-	const metadataSummary = [
-		`Workspace root: ${workspaceRoot}`,
-		`Active file: ${filePath}`,
-		`Language: ${doc.languageId}`,
-		`Cursor (1-based): line ${cursorLine}, column ${cursorColumn}`
-	].join('\n');
-	const metadataCommand = [
-		"cat <<'EOF'",
-		metadataSummary,
-		'EOF'
-	].join('\n');
 
+	// FIXME (f.srambical): This should be the system prompt that was used during serialization.
 	const systemPrompt = [
 		'You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.',
 		'Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).',
@@ -767,20 +1369,15 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		'When you are NOT editing files (e.g., running tests, git commands, tools, etc.), you may emit arbitrary bash commands.'
 	].join('\n');
 
+	const accumulatedMessages = conversationManager.finalizeForModel();
+	
 	const conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
 		{ role: 'system', content: systemPrompt },
-		{ role: 'assistant', content: fencedBashBlock(metadataCommand) },
-		{ role: 'user', content: formatStdoutBlock(metadataSummary) },
-		{ role: 'assistant', content: fencedBashBlock(`cat -n ${filePath}`) },
-		{ role: 'user', content: formatStdoutBlock(formatLineNumberedOutput(fullText)) }
 	];
-
-	if (viewport.end >= viewport.start) {
-		const viewportOutput = formatLineNumberedOutput(fullText, viewport.start, viewport.end);
-		conversationMessages.push(
-			{ role: 'assistant', content: fencedBashBlock(`cat -n ${filePath} | sed -n '${viewport.start},${viewport.end}p'`) },
-			{ role: 'user', content: formatStdoutBlock(viewportOutput) }
-		);
+	
+	for (const msg of accumulatedMessages) {
+		const role = msg.from === 'User' ? 'user' : 'assistant';
+		conversationMessages.push({ role, content: msg.value });
 	}
 
 	const requestBody: any = {
@@ -794,7 +1391,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		requestBody.min_p = 0;
 		requestBody.extra_body = {
 			chat_template_kwargs: {
-				enable_thinking: false
+				enable_thinking: true
 			}
 		};
 	}
@@ -869,20 +1466,16 @@ function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedActi
 	if (!normalized) {
 		return undefined;
 	}
-	// Try to interpret the command as a structured VS Code action derived from the bash transcript.
 	if (doc) {
-		// 1) Edits encoded as sed -i ... (insert/replace/delete)
 		const editAction = parseEditFromSedCommand(normalized, doc);
 		if (editAction) {
 			return editAction;
 		}
-		// 2) Viewport / selection moves encoded as cat -n ... | sed -n 'vstart,vendp'
 		const viewportAction = parseViewportFromCatCommand(normalized, doc);
 		if (viewportAction) {
 			return viewportAction;
 		}
 	}
-	// Fallback: execute the raw command in the integrated terminal.
 	return { kind: 'terminalSendText', text: normalized };
 }
 
@@ -912,7 +1505,6 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 	const script = sedMatch[1] ?? '';
 	const targetFile = sedMatch[2] ?? '';
 	const activePath = doc.uri.fsPath;
-	// Be conservative: only apply edits when the sed target matches the active document path.
 	if (targetFile !== activePath) {
 		return undefined;
 	}
@@ -952,13 +1544,11 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
 			return undefined;
 		}
-		// Unescape single quotes as done in _escape_single_quotes_for_sed.
 		payload = payload.replace(/'\"'\"'/g, "'");
 		const startLine0 = Math.max(0, startLine1 - 1);
 		const endLine0 = Math.max(0, endLine1 - 1);
 		const startPos: [number, number] = [startLine0, 0];
 
-		// Replace up to the start of the line after endLine, or end-of-document.
 		let endPosLine = endLine0 + 1;
 		let endPosChar = 0;
 		if (endPosLine >= doc.lineCount) {
@@ -966,7 +1556,6 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 			endPosChar = doc.lineAt(endPosLine).range.end.character;
 		}
 
-		// Preserve multi-line payload as-is; append a trailing newline so sed-style replacements map naturally.
 		const text = payload.endsWith('\n') ? payload : payload + '\n';
 		return {
 			kind: 'editReplace',
@@ -975,7 +1564,6 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 		};
 	}
 
-	// Insert before a given line: "STARTi\newline<payload...>"
 	const insertMatch = script.match(/^(\d+)i\\\n([\s\S]*)$/);
 	if (insertMatch) {
 		const line1 = Number(insertMatch[1]);
@@ -994,7 +1582,6 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 		};
 	}
 
-	// Append at end of file: "$a\newline<payload...>"
 	const appendMatch = script.match(/^\$a\\\n([\s\S]*)$/);
 	if (appendMatch) {
 		let payload = appendMatch[1] ?? '';
