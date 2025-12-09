@@ -4,10 +4,16 @@ import * as http from 'http';
 import { Buffer } from 'buffer';
 
 
-const SGLANG_HOSTNAME = 'hai001';
-const SGLANG_PORT = 30000;
-const SGLANG_BASE_PATH = '/v1/chat/completions';
-const SGLANG_MODEL_NAME = 'qwen/qwen3-8b';
+// Configuration helper
+function getConfig() {
+	const config = vscode.workspace.getConfiguration('crowd-pilot');
+	return {
+		hostname: config.get<string>('hostname', 'hai001'),
+		port: config.get<number>('port', 30000),
+		basePath: config.get<string>('basePath', '/v1/chat/completions'),
+		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
+	};
+}
 
 // -------------------- Serialization Helpers (mirrors serialization_utils.py) --------------------
 const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
@@ -18,8 +24,9 @@ const ANSI_OSC_LINE_FALLBACK_RE = /\x1b\][^\n]*$/g;
 const VIEWPORT_RADIUS = 10;
 const COALESCE_RADIUS = 5;
 
-// Minimum cumulative logprob threshold for displaying suggestions
-const MIN_CUMULATIVE_LOGPROB = -50;
+// Minimum average logprob per token threshold for displaying suggestions
+// -1.0 ≈ perplexity 2.7 (very confident)
+const MIN_AVG_LOGPROB = -1.0;
 
 function cleanText(text: string): string {
 	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
@@ -644,6 +651,22 @@ const conversationManager = new ConversationStateManager();
 // Track activated files (files whose content we've captured)
 const activatedFiles = new Set<string>();
 
+let suggestionsEnabled = true;
+let statusBarItem: vscode.StatusBarItem | undefined;
+
+function updateStatusBarItem(): void {
+	if (!statusBarItem) { return; }
+	if (suggestionsEnabled) {
+		statusBarItem.text = '$(lightbulb) crowd-pilot';
+		statusBarItem.tooltip = 'crowd-pilot: Tab suggestions enabled (click to disable)';
+		statusBarItem.backgroundColor = undefined;
+	} else {
+		statusBarItem.text = '$(lightbulb-autofix) crowd-pilot';
+		statusBarItem.tooltip = 'crowd-pilot: Tab suggestions disabled (click to enable)';
+		statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+	}
+}
+
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
@@ -664,6 +687,25 @@ export function activate(context: vscode.ExtensionContext) {
 			await config.update('commandsToSkipShell', commandsToSkipShell, vscode.ConfigurationTarget.Global);
 		}
 	})().catch((err) => console.error('[crowd-pilot] Startup initialization error:', err));
+
+	statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+	statusBarItem.command = 'crowd-pilot.toggleSuggestions';
+	updateStatusBarItem();
+	statusBarItem.show();
+	context.subscriptions.push(statusBarItem);
+
+	const toggleSuggestions = vscode.commands.registerCommand('crowd-pilot.toggleSuggestions', () => {
+		suggestionsEnabled = !suggestionsEnabled;
+		updateStatusBarItem();
+		if (!suggestionsEnabled) {
+			hidePreviewUI(true);
+		}
+		vscode.window.showInformationMessage(
+			suggestionsEnabled 
+				? '[crowd-pilot]: Tab suggestions enabled' 
+				: '[crowd-pilot]: Tab suggestions disabled'
+		);
+	});
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
 		hidePreviewUI(true);
@@ -772,6 +814,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	context.subscriptions.push(
+		toggleSuggestions,
 		hideUi,
 		sglangTest,
 		modelRun,
@@ -1102,6 +1145,9 @@ function hidePreviewUI(suppress?: boolean): void {
  * throttling how often we actually talk to the model.
  */
 function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): void {
+	if (!suggestionsEnabled) {
+		return;
+	}
 	if (!userRequested && suppressAutoPreview) {
 		return;
 	}
@@ -1182,13 +1228,14 @@ async function autoShowNextAction(): Promise<void> {
 
 // -------------------- SGLang Client (simple test) --------------------
 async function callSGLangChat(): Promise<void> {
+	const cfg = getConfig();
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
 
 
 	const requestBody: any = {
-		model: SGLANG_MODEL_NAME,
+		model: cfg.modelName,
 		messages: [
 			{ role: 'user', content: 'What is the capital of France?' }
 		]
@@ -1204,9 +1251,9 @@ async function callSGLangChat(): Promise<void> {
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
 	const options = {
-		hostname: SGLANG_HOSTNAME,
-		port: SGLANG_PORT,
-		path: SGLANG_BASE_PATH,
+		hostname: cfg.hostname,
+		port: cfg.port,
+		path: cfg.basePath,
 		method: 'POST',
 		headers
 	};
@@ -1245,6 +1292,7 @@ async function callSGLangChat(): Promise<void> {
 
 // -------------------- Model-planned Actions --------------------
 async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<PlannedAction> {
+	const cfg = getConfig();
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
@@ -1318,7 +1366,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	}
 
 	const requestBody: any = {
-		model: SGLANG_MODEL_NAME,
+		model: cfg.modelName,
 		messages: conversationMessages
 	};
 	requestBody.temperature = 0.7;
@@ -1334,9 +1382,9 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
 	const options: any = {
-		hostname: SGLANG_HOSTNAME,
-		port: SGLANG_PORT,
-		path: SGLANG_BASE_PATH,
+		hostname: cfg.hostname,
+		port: cfg.port,
+		path: cfg.basePath,
 		method: 'POST',
 		headers
 	};
@@ -1361,9 +1409,9 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		req.end();
 	});
 
-	const cumulativeLogprob = calculateCumulativeLogprob(json);
-	if (cumulativeLogprob < MIN_CUMULATIVE_LOGPROB) {
-		return undefined as any; // Low certainty, silently skip suggestion
+	const avgLogprob = calculateAverageLogprob(json);
+	if (avgLogprob < MIN_AVG_LOGPROB) {
+		return undefined as any; // Low confidence, silently skip suggestion
 	}
 
 	const content = extractChatContent(json);
@@ -1395,13 +1443,14 @@ function extractChatContent(json: any): string | undefined {
 }
 
 /**
- * Calculate cumulative logprob (sum of token log probabilities) from the API response.
- * Returns the sum of logprobs for the entire sequence (negative value, closer to 0 = more confident).
- * Returns null if logprobs are not available.
+ * Calculate average logprob per token from the API response.
+ * Returns the mean of logprobs across all tokens (negative value, closer to 0 = more confident).
+ * Returns -Infinity if logprobs are not available.
  */
-function calculateCumulativeLogprob(json: any): number {
-	const logprobs = json.choices[0].logprobs;
-	return logprobs.content.reduce((sum: number, tokenInfo: any) => sum + tokenInfo.logprob, 0);
+function calculateAverageLogprob(json: any): number {
+	const logprobs = json.choices[0]?.logprobs;
+	const sum = logprobs.content.reduce((s: number, t: any) => s + t.logprob, 0);
+	return sum / logprobs.content.length;
 }
 
 function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedAction | undefined {
