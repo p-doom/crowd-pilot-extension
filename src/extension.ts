@@ -7,14 +7,7 @@ import { Buffer } from 'buffer';
 const SGLANG_HOSTNAME = 'hai001';
 const SGLANG_PORT = 30000;
 const SGLANG_BASE_PATH = '/v1/chat/completions';
-const SGLANG_MODEL_NAME = 'qwen/qwen3-0.6b';
-
-const GEMINI_HOSTNAME = 'generativelanguage.googleapis.com';
-const GEMINI_PORT = 443;
-const GEMINI_BASE_PATH = '/v1beta/openai/chat/completions';
-const GEMINI_MODEL_NAME = 'gemini-2.5-flash';
-
-const USE_GEMINI = false;
+const SGLANG_MODEL_NAME = 'qwen/qwen3-8b';
 
 // -------------------- Serialization Helpers (mirrors serialization_utils.py) --------------------
 const ANSI_CSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
@@ -24,6 +17,9 @@ const ANSI_OSC_LINE_FALLBACK_RE = /\x1b\][^\n]*$/g;
 // NOTE (f.srambical): Make sure that these are the parameters that were used during serialization
 const VIEWPORT_RADIUS = 10;
 const COALESCE_RADIUS = 5;
+
+// Minimum cumulative logprob threshold for displaying suggestions
+const MIN_CUMULATIVE_LOGPROB = -50;
 
 function cleanText(text: string): string {
 	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
@@ -1186,71 +1182,39 @@ async function autoShowNextAction(): Promise<void> {
 
 // -------------------- SGLang Client (simple test) --------------------
 async function callSGLangChat(): Promise<void> {
-	const config = vscode.workspace.getConfiguration();
-	
-	let hostname: string;
-	let port: number;
-	let path: string;
-	let useHttps = true;
-	let modelName: string;
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
 
-	if (!USE_GEMINI) {
-		// SGLang
-		hostname = SGLANG_HOSTNAME;
-		port = SGLANG_PORT;
-		path = SGLANG_BASE_PATH;
-		useHttps = false; 
-		modelName = SGLANG_MODEL_NAME;
-	} else {
-		// Gemini
-		const apiKey = config.get<string>('crowd-pilot.apiKey');
-		if (!apiKey) {
-			vscode.window.showErrorMessage('Crowd Pilot: Please set your API Key in settings (crowd-pilot.apiKey).');
-			return;
-		}
-		hostname = GEMINI_HOSTNAME;
-		port = GEMINI_PORT;
-		path = GEMINI_BASE_PATH;
-		headers['Authorization'] = `Bearer ${apiKey}`;
-		modelName = GEMINI_MODEL_NAME;
-	}
 
 	const requestBody: any = {
-		model: modelName,
+		model: SGLANG_MODEL_NAME,
 		messages: [
 			{ role: 'user', content: 'What is the capital of France?' }
 		]
 	};
-	if (!USE_GEMINI) {
-		requestBody.temperature = 0.7;
-		requestBody.top_p = 0.8;
-		requestBody.top_k = 20;
-		requestBody.min_p = 0;
-		requestBody.extra_body = {
-			chat_template_kwargs: {
-				enable_thinking: false
-			}
-		};
-	}
+	requestBody.temperature = 0.7;
+	requestBody.top_p = 0.8;
+	requestBody.top_k = 20;
+	requestBody.min_p = 0;
+	requestBody.chat_template_kwargs = {
+		enable_thinking: false
+	};
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
 	const options = {
-		hostname,
-		port,
-		path,
+		hostname: SGLANG_HOSTNAME,
+		port: SGLANG_PORT,
+		path: SGLANG_BASE_PATH,
 		method: 'POST',
 		headers
 	};
 
-	const requestModule = useHttps ? https : http;
 
 	try {
 		const json = await new Promise<any>((resolve, reject) => {
-			const req = requestModule.request(options, (res: http.IncomingMessage) => {
+			const req = http.request(options, (res: http.IncomingMessage) => {
 				let data = '';
 				res.on('data', (chunk: Buffer) => {
 					data += chunk.toString();
@@ -1281,43 +1245,16 @@ async function callSGLangChat(): Promise<void> {
 
 // -------------------- Model-planned Actions --------------------
 async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<PlannedAction> {
-	const config = vscode.workspace.getConfiguration();
-	
-	let hostname: string;
-	let port: number;
-	let path: string;
-	let useHttps = true;
-	let modelName: string;
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
-
-	if (!USE_GEMINI) {
-		// SGLang
-		hostname = SGLANG_HOSTNAME;
-		port = SGLANG_PORT;
-		path = SGLANG_BASE_PATH;
-		useHttps = false;
-		modelName = SGLANG_MODEL_NAME;
-	} else {
-		// Gemini
-		const apiKey = config.get<string>('crowd-pilot.apiKey');
-		if (!apiKey) {
-			vscode.window.showErrorMessage('Crowd Pilot: Please set your API Key in settings (crowd-pilot.apiKey).');
-			throw new Error('API key not set');
-		}
-		hostname = GEMINI_HOSTNAME;
-		port = GEMINI_PORT;
-		path = GEMINI_BASE_PATH;
-		headers['Authorization'] = `Bearer ${apiKey}`;
-		modelName = GEMINI_MODEL_NAME;
-	}
 
 	const doc = editor.document;
 
 	// FIXME (f.srambical): This should be the system prompt that was used during serialization.
 	const systemPrompt = [
 		'You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.',
+		'Your goal is to predict the next assistant action based on the conversation history and context provided.',
 		'Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).',
 		'',
 		'Format your response as shown in <format_example>.',
@@ -1381,28 +1318,25 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	}
 
 	const requestBody: any = {
-		model: modelName,
+		model: SGLANG_MODEL_NAME,
 		messages: conversationMessages
 	};
-	if (!USE_GEMINI) {
-		requestBody.temperature = 0.7;
-		requestBody.top_p = 0.8;
-		requestBody.top_k = 20;
-		requestBody.min_p = 0;
-		requestBody.extra_body = {
-			chat_template_kwargs: {
-				enable_thinking: true
-			}
-		};
-	}
+	requestBody.temperature = 0.7;
+	requestBody.top_p = 0.8;
+	requestBody.top_k = 20;
+	requestBody.min_p = 0;
+	requestBody.logprobs = true;
+	requestBody.chat_template_kwargs = {
+		enable_thinking: false
+	};
 
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
 	const options: any = {
-		hostname,
-		port,
-		path,
+		hostname: SGLANG_HOSTNAME,
+		port: SGLANG_PORT,
+		path: SGLANG_BASE_PATH,
 		method: 'POST',
 		headers
 	};
@@ -1410,10 +1344,8 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		options.signal = signal;
 	}
 
-	const requestModule = useHttps ? https : http;
-
 	const json = await new Promise<any>((resolve, reject) => {
-		const req = requestModule.request(options, (res: http.IncomingMessage) => {
+		const req = http.request(options, (res: http.IncomingMessage) => {
 			let data = '';
 			res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
 			res.on('end', () => {
@@ -1428,6 +1360,11 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		req.write(postData);
 		req.end();
 	});
+
+	const cumulativeLogprob = calculateCumulativeLogprob(json);
+	if (cumulativeLogprob < MIN_CUMULATIVE_LOGPROB) {
+		return undefined as any; // Low certainty, silently skip suggestion
+	}
 
 	const content = extractChatContent(json);
 	if (typeof content !== 'string' || content.trim().length === 0) {
@@ -1455,6 +1392,16 @@ function extractChatContent(json: any): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Calculate cumulative logprob (sum of token log probabilities) from the API response.
+ * Returns the sum of logprobs for the entire sequence (negative value, closer to 0 = more confident).
+ * Returns null if logprobs are not available.
+ */
+function calculateCumulativeLogprob(json: any): number {
+	const logprobs = json.choices[0].logprobs;
+	return logprobs.content.reduce((sum: number, tokenInfo: any) => sum + tokenInfo.logprob, 0);
 }
 
 function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedAction | undefined {
@@ -1545,6 +1492,8 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 			return undefined;
 		}
 		payload = payload.replace(/'\"'\"'/g, "'");
+		// Convert escape sequences to actual characters
+		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
 		const startLine0 = Math.max(0, startLine1 - 1);
 		const endLine0 = Math.max(0, endLine1 - 1);
 		const startPos: [number, number] = [startLine0, 0];
@@ -1572,6 +1521,8 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 			return undefined;
 		}
 		payload = payload.replace(/'\"'\"'/g, "'");
+		// Convert escape sequences to actual characters
+		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
 		const insertLine0 = Math.max(0, line1 - 1);
 		const position: [number, number] = [insertLine0, 0];
 		const text = payload.endsWith('\n') ? payload : payload + '\n';
@@ -1586,6 +1537,8 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
 	if (appendMatch) {
 		let payload = appendMatch[1] ?? '';
 		payload = payload.replace(/'\"'\"'/g, "'");
+		// Convert escape sequences to actual characters
+		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
 		const insertLine0 = doc.lineCount;
 		const position: [number, number] = [insertLine0, 0];
 		const needsLeadingNewline = doc.lineCount > 0;
