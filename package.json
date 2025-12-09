@@ -2,8 +2,12 @@
   "name": "crowd-pilot",
   "displayName": "crowd-pilot-extension",
   "description": "Teaching language models to code like humans.",
-  "publisher": "p(doom)",
+  "publisher": "p-doom",
   "version": "0.0.1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/p-doom/crowd-pilot-extension"
+  },
   "engines": {
     "vscode": "^1.99.3"
   },
@@ -17,6 +21,10 @@
   "contributes": {
     "commands": [
       {
+        "command": "crowd-pilot.toggleSuggestions",
+        "title": "crowd-pilot: Toggle Tab Suggestions"
+      },
+      {
         "command": "crowd-pilot.hideUi",
         "title": "crowd-pilot: Hide Preview"
       },
@@ -29,6 +37,36 @@
         "title": "crowd-pilot: Model Plan & Run"
       }
     ],
+    "configuration": {
+      "title": "crowd-pilot",
+      "properties": {
+        "crowd-pilot.hostname": {
+          "type": "string",
+          "default": "hai002",
+          "description": "Hostname of the SGLang server"
+        },
+        "crowd-pilot.port": {
+          "type": "number",
+          "default": 30000,
+          "description": "Port of the SGLang server"
+        },
+        "crowd-pilot.basePath": {
+          "type": "string",
+          "default": "/v1/chat/completions",
+          "description": "Base path for the SGLang API endpoint"
+        },
+        "crowd-pilot.modelName": {
+          "type": "string",
+          "default": "qwen/qwen3-8b",
+          "description": "Model name to use for completions"
+        },
+        "crowd-pilot.minAvgLogprob": {
+          "type": "number",
+          "default": -1.0,
+          "description": "Minimum average log-probability per token for displaying suggestions. Higher values (closer to 0) require more confidence. -1.0 ≈ perplexity 2.7"
+        }
+      }
+    },
     "keybindings": [
       {
         "command": "crowd-pilot.modelRun",
@@ -59,7 +97,7 @@
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.105.0",
+    "@types/vscode": "^1.99.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "@typescript-eslint/eslint-plugin": "^8.45.0",
