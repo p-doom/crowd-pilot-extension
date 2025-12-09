@@ -12,6 +12,7 @@ function getConfig() {
 		port: config.get<number>('port', 30000),
 		basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
+		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
 	};
 }
 
@@ -23,10 +24,6 @@ const ANSI_OSC_LINE_FALLBACK_RE = /\x1b\][^\n]*$/g;
 // NOTE (f.srambical): Make sure that these are the parameters that were used during serialization
 const VIEWPORT_RADIUS = 10;
 const COALESCE_RADIUS = 5;
-
-// Minimum average logprob per token threshold for displaying suggestions
-// -1.0 ≈ perplexity 2.7 (very confident)
-const MIN_AVG_LOGPROB = -1.0;
 
 function cleanText(text: string): string {
 	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
@@ -1301,11 +1298,22 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 
 	// FIXME (f.srambical): This should be the system prompt that was used during serialization.
 	const systemPrompt = [
-		'You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.',
-		'Your goal is to predict the next assistant action based on the conversation history and context provided.',
-		'Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).',
+		'You are a helpful assistant that interacts with a computer shell to solve programming tasks.',
+		'Your goal is to predict the next bash command a developer would most likely execute, given their editing and navigation history.',
 		'',
-		'Format your response as shown in <format_example>.',
+		'=== CONVERSATION FORMAT ===',
+		'The conversation history alternates between:',
+		'- Assistant messages: bash commands in fenced code blocks',
+		'- User messages: command output wrapped in <stdout>...</stdout> tags',
+		'',
+		'File contents are displayed with 6-character right-aligned line numbers followed by a tab, e.g.:',
+		'     1\tfirst line',
+		'     2\tsecond line',
+		'',
+		'File content is typically shown in viewports of ~20 lines around the area of interest.',
+		'',
+		'=== RESPONSE FORMAT ===',
+		'Your response must contain exactly ONE bash code block with one command or two commands connected with &&.',
 		'',
 		'<format_example>',
 		'```bash',
@@ -1410,7 +1418,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	});
 
 	const avgLogprob = calculateAverageLogprob(json);
-	if (avgLogprob < MIN_AVG_LOGPROB) {
+	if (avgLogprob < cfg.minAvgLogprob) {
 		return undefined as any; // Low confidence, silently skip suggestion
 	}
 
