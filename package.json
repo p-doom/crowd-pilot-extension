@@ -35,6 +35,14 @@
       {
         "command": "crowd-pilot.modelRun",
         "title": "crowd-pilot: Model Plan & Run"
+      },
+      {
+        "command": "crowd-pilot.clearContext",
+        "title": "crowd-pilot: Clear Context"
+      },
+      {
+        "command": "crowd-pilot.openPreferenceLog",
+        "title": "crowd-pilot: Open Preference Log"
       }
     ],
     "configuration": {
@@ -64,6 +72,21 @@
           "type": "number",
           "default": -1.0,
           "description": "Minimum average log-probability per token for displaying suggestions. Higher values (closer to 0) require more confidence. -1.0 ≈ perplexity 2.7"
+        },
+        "crowd-pilot.maxContextTokens": {
+          "type": "number",
+          "default": 120000,
+          "description": "Context length (in tokens). Older messages are truncated to fit. Set below your model's limit to leave room for the response."
+        },
+        "crowd-pilot.enablePreferenceLogging": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable logging of accept/reject data for reward model training and RLHF/DPO"
+        },
+        "crowd-pilot.preferenceLogPath": {
+          "type": "string",
+          "default": "",
+          "description": "Custom path for the preference log file (JSONL format). If empty, uses workspace/.crowd-pilot-preferences.jsonl"
         }
       }
     },

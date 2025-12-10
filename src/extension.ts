@@ -1,8 +1,130 @@
 import * as vscode from 'vscode';
-import * as https from 'https';
 import * as http from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Buffer } from 'buffer';
 
+// -------------------- Preference Data Collection --------------------
+
+interface PreferenceSample {
+	timestamp: number;
+	context: Array<{ role: string; content: string }>;
+	completion: {
+		rawModelOutput: string;
+		parsedAction: Action | null;
+		avgLogprob: number;
+	};
+	outcome: 'accepted' | 'rejected' | 'ignored' | null;
+	outcomeTimestamp: number | null;
+	modelName: string;
+}
+
+interface PendingPreferenceSample {
+	sample: PreferenceSample;
+	shownAt: number;
+}
+
+let pendingPreferenceSample: PendingPreferenceSample | null = null;
+
+function getPreferenceLogPath(): string {
+	const cfg = getConfig();
+	if (cfg.preferenceLogPath) {
+		return cfg.preferenceLogPath;
+	}
+	const workspaceFolders = vscode.workspace.workspaceFolders;
+	if (workspaceFolders) {
+		return path.join(workspaceFolders[0].uri.fsPath, '.crowd-pilot-preferences.jsonl');
+	}
+	throw new Error("No preference log path found.")
+}
+
+/**
+ * Log a preference sample to the JSONL file.
+ * Each line is a complete JSON object for easy streaming/parsing.
+ */
+function logPreferenceSample(sample: PreferenceSample): void {
+	const cfg = getConfig();
+	if (!cfg.enablePreferenceLogging) {
+		console.log(`[crowd-pilot] Preference logging disabled, skipping sample`);
+		return;
+	}
+
+	const logPath = getPreferenceLogPath();
+	const line = JSON.stringify(sample) + '\n';
+	
+	fs.appendFile(logPath, line, (err) => {
+		if (err) {
+			console.error('[crowd-pilot] Failed to log preference sample:', err);
+		} else {
+			console.log(`[crowd-pilot] Logged preference sample, outcome: (${sample.outcome})`);
+		}
+	});
+}
+
+/**
+ * Create a new pending preference sample when showing a preview.
+ * This captures all context needed for reward model training.
+ */
+function createPendingPreferenceSample(
+	conversationMessages: Array<{ role: string; content: string }>,
+	rawModelOutput: string,
+	parsedAction: Action | null,
+	avgLogprob: number,
+	modelName: string
+): void {
+	const sample: PreferenceSample = {
+		timestamp: Date.now(),
+		context: conversationMessages,
+		completion: {
+			rawModelOutput,
+			parsedAction,
+			avgLogprob,
+		},
+		outcome: null,
+		outcomeTimestamp: null,
+		modelName,
+	};
+
+	pendingPreferenceSample = {
+		sample,
+		shownAt: Date.now(),
+	};
+}
+
+/**
+ * Record the outcome of the current pending sample and log it.
+ */
+function recordPreferenceOutcome(outcome: 'accepted' | 'rejected' | 'ignored'): void {
+	if (!pendingPreferenceSample) {
+		return;
+	}
+
+	const sample = pendingPreferenceSample.sample;
+	sample.outcome = outcome;
+	sample.outcomeTimestamp = Date.now();
+
+	logPreferenceSample(sample);
+
+	pendingPreferenceSample = null;
+}
+
+/**
+ * Mark any pending sample as ignored (user moved on without explicit accept/reject).
+ */
+function markPendingAsIgnored(): void {
+	if (pendingPreferenceSample) {
+		recordPreferenceOutcome('ignored');
+	}
+}
+
+type Action =
+| { kind: 'showTextDocument' }
+| { kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }
+| { kind: 'editInsert', position: [number, number], text: string }
+| { kind: 'editDelete', range: { start: [number, number], end: [number, number] } }
+| { kind: 'editReplace', range: { start: [number, number], end: [number, number] }, text: string }
+| { kind: 'terminalShow' }
+| { kind: 'terminalSendText', text: string };
 
 // Configuration helper
 function getConfig() {
@@ -13,7 +135,55 @@ function getConfig() {
 		basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
 		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
+		maxContextTokens: config.get<number>('maxContextTokens', 120000),
+		preferenceLogPath: config.get<string>('preferenceLogPath', ''),
+		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
 	};
+}
+
+// -------------------- Context Window Management --------------------
+
+/**
+ * Estimate token count from text using character-based heuristic.
+ * Uses ~4 characters per token as a rough approximation for most LLMs.
+ */
+function estimateTokens(text: string): number {
+	return Math.ceil(text.length / 4);
+}
+
+/**
+ * Truncate conversation messages to fit within the context window.
+ * Assumes system prompt is the first message. Drops oldest conversation messages first.
+ */
+function truncateToContextLimit(
+	messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+	maxTokens: number
+): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
+	if (messages.length === 0) { return messages; }
+
+	const systemTokens = estimateTokens(messages[0].content);
+	const availableTokens = maxTokens - systemTokens;
+
+	const tokenCounts = messages.slice(1).map(m => estimateTokens(m.content));
+	const totalConversationTokens = tokenCounts.reduce((a, b) => a + b, 0);
+
+	if (totalConversationTokens <= availableTokens) {
+		return messages;
+	}
+
+	let keptTokens = 0;
+	let cutoffIndex = tokenCounts.length;
+	for (let i = tokenCounts.length - 1; i >= 0; i--) {
+		if (keptTokens + tokenCounts[i] <= availableTokens) {
+			keptTokens += tokenCounts[i];
+			cutoffIndex = i;
+		} else {
+			break;
+		}
+	}
+
+	console.log(`[crowd-pilot] Truncated ${cutoffIndex} oldest messages (${systemTokens + totalConversationTokens} -> ${systemTokens + keptTokens} tokens)`);
+	return [messages[0], ...messages.slice(cutoffIndex + 1)];
 }
 
 // -------------------- Serialization Helpers (mirrors serialization_utils.py) --------------------
@@ -24,6 +194,9 @@ const ANSI_OSC_LINE_FALLBACK_RE = /\x1b\][^\n]*$/g;
 // NOTE (f.srambical): Make sure that these are the parameters that were used during serialization
 const VIEWPORT_RADIUS = 10;
 const COALESCE_RADIUS = 5;
+// FIXME (f.srambical): this slightly differs from the logic in @file:crowd-pilot/crowd_pilot/serialization_utils.py
+// as we only approximate the token count
+const MAX_TOKENS_PER_MESSAGE = 2048;
 
 function cleanText(text: string): string {
 	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
@@ -353,6 +526,11 @@ class ConversationStateManager {
 	}
 
 	private appendMessage(message: ConversationMessage): void {
+		const tokens = estimateTokens(message.value);
+		if (tokens > MAX_TOKENS_PER_MESSAGE) {
+			const maxChars = MAX_TOKENS_PER_MESSAGE * 4;
+			message.value = message.value.slice(0, maxChars);
+		}
 		this.messages.push(message);
 	}
 
@@ -648,6 +826,16 @@ const conversationManager = new ConversationStateManager();
 // Track activated files (files whose content we've captured)
 const activatedFiles = new Set<string>();
 
+/**
+ * Clear all conversation context - resets the conversation manager and activated files.
+ * Call this to start fresh without accumulated history.
+ */
+function clearContext(): void {
+	conversationManager.reset();
+	activatedFiles.clear();
+	console.log('[crowd-pilot] Context cleared');
+}
+
 let suggestionsEnabled = true;
 let statusBarItem: vscode.StatusBarItem | undefined;
 
@@ -705,7 +893,27 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
+		recordPreferenceOutcome('rejected');
 		hidePreviewUI(true);
+	});
+
+	const clearContextCmd = vscode.commands.registerCommand('crowd-pilot.clearContext', () => {
+		clearContext();
+		vscode.window.showInformationMessage('[crowd-pilot]: Context cleared');
+	});
+
+	const openPreferenceLogCmd = vscode.commands.registerCommand('crowd-pilot.openPreferenceLog', async () => {
+		const logPath = getPreferenceLogPath();
+		try {
+			const uri = vscode.Uri.file(logPath);
+			await vscode.window.showTextDocument(uri);
+		} catch (err: any) {
+			if (err.code === 'ENOENT' || err.message?.includes('ENOENT')) {
+				vscode.window.showInformationMessage('[crowd-pilot] No preference log file exists yet. Accept or reject some suggestions first.');
+			} else {
+				vscode.window.showErrorMessage(`[crowd-pilot] Error opening preference log: ${err.message}`);
+			}
+		}
 	});
 
 	const modelRun = vscode.commands.registerCommand('crowd-pilot.modelRun', async () => {
@@ -715,7 +923,7 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		try {
 			if (!previewVisible) { return; }
-			let action: PlannedAction | undefined = currentAction;
+			let action: Action | undefined = currentAction;
 			if (!action) {
 				const single = await requestModelActions(editor);
 				currentAction = single;
@@ -725,6 +933,7 @@ export function activate(context: vscode.ExtensionContext) {
 				hidePreviewUI();
 				return;
 			}
+			recordPreferenceOutcome('accepted');
 			hidePreviewUI(false);
 			await executeAction(action);
 			autoShowNextAction();
@@ -813,6 +1022,8 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		toggleSuggestions,
 		hideUi,
+		clearContextCmd,
+		openPreferenceLogCmd,
 		sglangTest,
 		modelRun,
 		onSelChange,
@@ -835,23 +1046,20 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {}
 
-// -------------------- Plan Types & Execution --------------------
-type PlannedAction =
-| { kind: 'showTextDocument' }
-| { kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }
-| { kind: 'editInsert', position: [number, number], text: string }
-| { kind: 'editDelete', range: { start: [number, number], end: [number, number] } }
-| { kind: 'editReplace', range: { start: [number, number], end: [number, number] }, text: string }
-| { kind: 'terminalShow' }
-| { kind: 'terminalSendText', text: string };
+// -------------------- Execution --------------------
+let currentAction: Action | undefined;
 
-let currentAction: PlannedAction | undefined;
+function getActiveOrCreateTerminal(): vscode.Terminal {
+	if (vscode.window.activeTerminal) {
+		return vscode.window.activeTerminal;
+	}
+	return vscode.window.createTerminal('crowd-pilot');
+}
 
-async function executeAction(action: PlannedAction): Promise<void> {
+async function executeAction(action: Action): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
 	const doc = editor.document;
-	const term = vscode.window.terminals[0] ?? vscode.window.createTerminal('Test');
 	if (action.kind === 'showTextDocument') {
 		await vscode.window.showTextDocument(doc);
 		return;
@@ -887,11 +1095,14 @@ async function executeAction(action: PlannedAction): Promise<void> {
 		return;
 	}
 	if (action.kind === 'terminalShow') {
+		const term = getActiveOrCreateTerminal();
 		term.show();
 		return;
 	}
 	if (action.kind === 'terminalSendText') {
-		term.sendText(action.text);
+		const term = getActiveOrCreateTerminal();
+		term.show();
+		term.sendText(action.text, false);
 		return;
 	}
 }
@@ -957,7 +1168,7 @@ function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: s
 	return `${margin}ch`;
 }
 
-function showPreviewUI(action: PlannedAction): void {
+function showPreviewUI(action: Action): void {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
 	disposePreviewDecorations();
@@ -1288,7 +1499,7 @@ async function callSGLangChat(): Promise<void> {
 }
 
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<PlannedAction> {
+async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<Action> {
 	const cfg = getConfig();
 	const headers: any = {
 		'Content-Type': 'application/json'
@@ -1364,7 +1575,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 
 	const accumulatedMessages = conversationManager.finalizeForModel();
 	
-	const conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
+	let conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
 		{ role: 'system', content: systemPrompt },
 	];
 	
@@ -1372,6 +1583,8 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		const role = msg.from === 'User' ? 'user' : 'assistant';
 		conversationMessages.push({ role, content: msg.value });
 	}
+
+	conversationMessages = truncateToContextLimit(conversationMessages, cfg.maxContextTokens);
 
 	const requestBody: any = {
 		model: cfg.modelName,
@@ -1426,10 +1639,21 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const action = parsePlannedAction(content, doc);
+	const action = parseAction(content, doc);
 	if (!action) {
 		throw new Error('No valid action parsed from model output');
 	}
+
+	markPendingAsIgnored();
+
+	createPendingPreferenceSample(
+		conversationMessages,
+		content,
+		action,
+		avgLogprob,
+		cfg.modelName
+	);
+
 	return action;
 }
 
@@ -1461,7 +1685,7 @@ function calculateAverageLogprob(json: any): number {
 	return sum / logprobs.content.length;
 }
 
-function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedAction | undefined {
+function parseAction(raw: string, doc?: vscode.TextDocument): Action | undefined {
 	const command = extractBashCommand(raw);
 	if (!command) {
 		return undefined;
@@ -1494,7 +1718,7 @@ function parsePlannedAction(raw: string, doc?: vscode.TextDocument): PlannedActi
  *
  * If the command does not match these patterns, returns undefined.
  */
-function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): PlannedAction | undefined {
+function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Action | undefined {
 	// Only consider the first command before && / ||, since cat -n etc. are for viewport only.
 	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
 	if (!main) {
@@ -1618,7 +1842,7 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Pla
  * into a lightweight VS Code selection move (setSelections). This mirrors how
  * selection and viewport events are serialized in serialization_utils.py.
  */
-function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument): PlannedAction | undefined {
+function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument): Action | undefined {
 	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
 	if (!main) {
 		return undefined;
