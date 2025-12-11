@@ -124,7 +124,8 @@ type Action =
 | { kind: 'editDelete', range: { start: [number, number], end: [number, number] } }
 | { kind: 'editReplace', range: { start: [number, number], end: [number, number] }, text: string }
 | { kind: 'terminalShow' }
-| { kind: 'terminalSendText', text: string };
+| { kind: 'terminalSendText', text: string }
+| { kind: 'openFile', filePath: string, selections?: Array<{ start: [number, number], end: [number, number] }> };
 
 // Configuration helper
 function getConfig() {
@@ -1069,9 +1070,7 @@ async function executeAction(action: Action): Promise<void> {
 			new vscode.Position(s.start[0], s.start[1]),
 			new vscode.Position(s.end[0], s.end[1])
 		));
-		if (editor.selections.length > 0) {
-			editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-		}
+		editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 		return;
 	}
 	if (action.kind === 'editInsert') {
@@ -1103,6 +1102,18 @@ async function executeAction(action: Action): Promise<void> {
 		const term = getActiveOrCreateTerminal();
 		term.show();
 		term.sendText(action.text, false);
+		return;
+	}
+	if (action.kind === 'openFile') {
+		const uri = vscode.Uri.file(action.filePath);
+		const openedEditor = await vscode.window.showTextDocument(uri);
+		if (action.selections) {
+			openedEditor.selections = action.selections.map(s => new vscode.Selection(
+				new vscode.Position(s.start[0], s.start[1]),
+				new vscode.Position(s.end[0], s.end[1])
+			));
+			openedEditor.revealRange(openedEditor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		}
 		return;
 	}
 }
@@ -1173,8 +1184,7 @@ function showPreviewUI(action: Action): void {
 	if (!editor) { return; }
 	disposePreviewDecorations();
 
-	// FIXME (f.srambical): add file switch 
-	const next = (action.kind === 'editInsert' || action.kind === 'editDelete' || action.kind === 'editReplace' || action.kind === 'terminalSendText' || action.kind === 'setSelections') ? action : undefined;
+	const next = (action.kind === 'editInsert' || action.kind === 'editDelete' || action.kind === 'editReplace' || action.kind === 'terminalSendText' || action.kind === 'setSelections' || action.kind === 'openFile') ? action : undefined;
 	if (!next) {
 		previewVisible = false;
 		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
@@ -1200,9 +1210,9 @@ function showPreviewUI(action: Action): void {
 			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
 			
 			if (targetPos.isBefore(firstVisible)) {
-				anchorPos = editor.document.lineAt(firstVisible.line).range.end;
+				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
 			} else {
-				anchorPos = editor.document.lineAt(lastVisible.line).range.end;
+				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
 			}
 
 			if (targetPos.line < anchorPos.line) {
@@ -1228,10 +1238,24 @@ function showPreviewUI(action: Action): void {
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
 	} else if (next.kind === 'terminalSendText') {
 		const cursor = editor.selection.active;
-		const lineEnd = editor.document.lineAt(cursor.line).range.end;
+		const isVisible = editor.visibleRanges.some(r => r.contains(cursor));
+		
+		let anchorPos = new vscode.Position(cursor.line, Number.MAX_VALUE);
+		
+		if (!isVisible && editor.visibleRanges.length > 0) {
+			const firstVisible = editor.visibleRanges[0].start;
+			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
+			
+			if (cursor.isBefore(firstVisible)) {
+				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
+			} else {
+				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
+			}
+		}
+		
 		const summary = trimText(next.text || '');
 		const label = `↳ Execute shell command in terminal: ${summary}`;
-		const margin = getDynamicMargin(editor, cursor.line, label);
+		const margin = getDynamicMargin(editor, anchorPos.line, label);
 
 		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
 			after: {
@@ -1244,7 +1268,7 @@ function showPreviewUI(action: Action): void {
 				textDecoration: `none; display: inline-block; white-space: pre; content: "${label.replace(/"/g, '\\"')}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(lineEnd, lineEnd) }]);
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
 	} else if (next.kind === 'editInsert') {
 		const posLine = next.position[0];
 		const fullBlock = next.text;
@@ -1329,6 +1353,42 @@ function showPreviewUI(action: Action): void {
 				fontWeight: '600',
 				margin: `0 0 0 ${margin}`,
 				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
+			}
+		});
+		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
+	} else if (next.kind === 'openFile') {
+		const cursor = editor.selection.active;
+		const isVisible = editor.visibleRanges.some(r => r.contains(cursor));
+		
+		let anchorPos = new vscode.Position(cursor.line, Number.MAX_VALUE);
+		
+		if (!isVisible && editor.visibleRanges.length > 0) {
+			const firstVisible = editor.visibleRanges[0].start;
+			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
+			
+			if (cursor.isBefore(firstVisible)) {
+				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
+			} else {
+				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
+			}
+		}
+		
+		const fileName = next.filePath.split(/[/\\]/).pop() || next.filePath;
+		const targetLine = next.selections?.[0]?.start[0];
+		const label = targetLine !== undefined
+			? `↳ Switch to file: ${fileName}:${targetLine + 1}` // Display as 1-based
+			: `↳ Switch to file: ${fileName}`;
+		const margin = getDynamicMargin(editor, anchorPos.line, label);
+
+		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
+			after: {
+				contentText: '',
+				color: new vscode.ThemeColor('charts.purple'),
+				backgroundColor: new vscode.ThemeColor('editor.background'),
+				fontStyle: 'italic',
+				fontWeight: '600',
+				margin: `0 0 0 ${margin}`,
+				textDecoration: `none; display: inline-block; white-space: pre; content: "${label.replace(/"/g, '\\"')}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
 			}
 		});
 		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
@@ -1853,7 +1913,7 @@ function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument):
 	if (simpleCatMatch) {
 		const targetFile = simpleCatMatch[1] ?? '';
 		if (targetFile !== doc.uri.fsPath) {
-			return undefined;
+			return { kind: 'openFile', filePath: targetFile };
 		}
 		// Ensure the active document is visible; rely on existing editor to handle this.
 		return { kind: 'showTextDocument' };
@@ -1869,29 +1929,29 @@ function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument):
 	const startStr = viewportMatch[2] ?? '';
 	const endStr = viewportMatch[3] ?? '';
 
-	if (targetFile !== doc.uri.fsPath) {
-		return undefined;
-	}
-
 	const startLine1 = Number(startStr);
 	const endLine1 = Number(endStr);
-	if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
-		return undefined;
-	}
 
 	// Place the cursor in the middle of the viewport (1-based to 0-based).
 	const center1 = Math.floor((startLine1 + endLine1) / 2);
 	const center0 = Math.max(0, center1 - 1);
+
+	if (targetFile !== doc.uri.fsPath) {
+		return {
+			kind: 'openFile',
+			filePath: targetFile,
+			selections: [{ start: [center0, 0], end: [center0, 0] }]
+		};
+	}
 	const lastLine = Math.max(0, doc.lineCount - 1);
 	const line = Math.min(center0, lastLine);
-	const endChar = doc.lineAt(line).range.end.character;
 
 	return {
 		kind: 'setSelections',
 		selections: [
 			{
-				start: [line, endChar],
-				end: [line, endChar],
+				start: [line, 0],
+				end: [line, 0],
 			},
 		],
 	};
