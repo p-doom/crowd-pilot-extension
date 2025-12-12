@@ -119,6 +119,9 @@
     "lint": "eslint src",
     "test": "vscode-test"
   },
+  "dependencies": {
+    "@crowd-pilot/serializer": "file:./crowd-pilot-serializer/crates/napi"
+  },
   "devDependencies": {
     "@types/vscode": "^1.99.3",
     "@types/mocha": "^10.0.10",

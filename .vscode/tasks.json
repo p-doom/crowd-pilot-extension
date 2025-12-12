@@ -4,8 +4,10 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"type": "npm",
-			"script": "watch",
+			"label": "watch",
+			"type": "shell",
+			// FIXME (f.srambical): We should make this cluster-agnostic
+			"command": "module load nodejs && npm run watch",
 			"problemMatcher": "$tsc-watch",
 			"isBackground": true,
 			"presentation": {
