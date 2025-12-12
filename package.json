@@ -117,7 +117,13 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "clean": "rm -rf out *.tgz",
+    "clean:all": "rm -rf out *.tgz node_modules package-lock.json",
+    "rebuild-serializer": "cd crowd-pilot-serializer/crates/napi && npm install && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && npm install"
+  },
+  "dependencies": {
+    "@crowd-pilot/serializer": "file:./crowd-pilot-serializer-0.1.0.tgz"
   },
   "devDependencies": {
     "@types/vscode": "^1.99.3",

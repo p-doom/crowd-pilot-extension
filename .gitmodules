@@ -1,0 +1,3 @@
+[submodule "crowd-pilot-serializer"]
+	path = crowd-pilot-serializer
+	url = https://github.com/p-doom/crowd-pilot-serializer

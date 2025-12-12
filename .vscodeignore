@@ -1,0 +1,27 @@
+# Source files
+src/**
+**/*.ts
+!out/**
+
+# Development files
+.vscode/**
+.git/**
+.gitignore
+.gitmodules
+eslint.config.mjs
+tsconfig.json
+vsc-extension-quickstart.md
+*.md
+!readme.md
+!changelog.md
+
+# Submodule source (native addon is in the tarball)
+crowd-pilot-serializer/**
+
+# Test files
+**/*.test.js
+**/test/**
+
+# Misc
+.crowd-pilot-preferences.jsonl
+**/.DS_Store
