@@ -3,7 +3,7 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
-import { ConversationStateManager, estimateTokens } from '@crowd-pilot/serializer';
+import { ConversationStateManager, estimateTokens, getDefaultSystemPrompt } from '@crowd-pilot/serializer';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -140,6 +140,7 @@ function getConfig() {
 		maxContextTokens: config.get<number>('maxContextTokens', 120000),
 		preferenceLogPath: config.get<string>('preferenceLogPath', ''),
 		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
+		viewportRadius: config.get<number>('viewportRadius', 10),
 	};
 }
 
@@ -182,7 +183,7 @@ function truncateToContextLimit(
 
 
 // Global conversation state manager instance
-const conversationManager = new ConversationStateManager();
+let conversationManager: ConversationStateManager;
 
 // Track activated files (files whose content we've captured)
 // TODO (f.srambical): This logic remains on the extension-side
@@ -220,6 +221,11 @@ function updateStatusBarItem(): void {
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
+
+	const cfg = getConfig();
+	conversationManager = new ConversationStateManager({
+		viewportRadius: cfg.viewportRadius,
+	});
 
 	(async () => {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
@@ -931,71 +937,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 
 	const doc = editor.document;
 
-	// FIXME (f.srambical): This should be the system prompt that was used during serialization.
-	const systemPrompt = [
-		'You are a helpful assistant that interacts with a computer shell to solve programming tasks.',
-		'Your goal is to predict the next bash command a developer would most likely execute, given their editing and navigation history.',
-		'',
-		'=== CONVERSATION FORMAT ===',
-		'The conversation history alternates between:',
-		'- Assistant messages: bash commands in fenced code blocks',
-		'- User messages: command output wrapped in <stdout>...</stdout> tags',
-		'',
-		'File contents are displayed with 6-character right-aligned line numbers followed by a tab, e.g.:',
-		'     1\tfirst line',
-		'     2\tsecond line',
-		'',
-		'File content is typically shown in viewports of ~20 lines around the area of interest.',
-		'',
-		'=== RESPONSE FORMAT ===',
-		'Your response must contain exactly ONE bash code block with one command or two commands connected with &&.',
-		'',
-		'<format_example>',
-		'```bash',
-		'your_command_here',
-		'```',
-		'</format_example>',
-		'',
-		'Failure to follow these rules will cause your response to be rejected.',
-		'',
-		'=== EDIT COMMAND FORMAT (IMPORTANT) ===',
-		'When you want to EDIT a file, you MUST encode the edit using line-based sed commands in ONE of the following forms,',
-		'and you MUST NOT use substitution commands like "Ns/old/new/g".',
-		'',
-		'Assume all line numbers are 1-based and paths are absolute.',
-		'Allowed edit encodings (choose exactly one per response):',
-		'',
-		'1) Replace a contiguous block of lines:',
-		"   sed -i 'START,ENDc\\",
-		'NEW_LINE_1',
-		'NEW_LINE_2',
-		"...",
-		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
-		'',
-		'2) Delete a contiguous block of lines:',
-		"   sed -i 'START,ENDd' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
-		'',
-		'3) Insert new lines BEFORE a given line:',
-		"   sed -i 'STARTi\\",
-		'NEW_LINE_1',
-		'NEW_LINE_2',
-		"...",
-		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
-		'',
-		'4) Append new lines at the END of the file:',
-		"   sed -i '$a\\",
-		'NEW_LINE_1',
-		'NEW_LINE_2',
-		"...",
-		"' /abs/path/to/file && cat -n /abs/path/to/file | sed -n 'VSTART,VENDp'",
-		'',
-		'Where VSTART and VEND specify a small viewport around the edited region.',
-		'',
-		'Do NOT emit commands like "3s/print/print()/g" or any other "s/old/new/" style sed substitution; instead,',
-		'always rewrite the affected lines using one of the line-based forms above.',
-		'',
-		'When you are NOT editing files (e.g., running tests, git commands, tools, etc.), you may emit arbitrary bash commands.'
-	].join('\n');
+	const systemPrompt = getDefaultSystemPrompt(cfg.viewportRadius);
 
 	const accumulatedMessages = conversationManager.finalizeForModel();
 	
