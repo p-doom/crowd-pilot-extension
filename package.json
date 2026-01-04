@@ -87,6 +87,11 @@
           "type": "string",
           "default": "",
           "description": "Custom path for the preference log file (JSONL format). If empty, uses workspace/.crowd-pilot-preferences.jsonl"
+        },
+        "crowd-pilot.viewportRadius": {
+          "type": "number",
+          "default": 10,
+          "description": "Number of lines above/below cursor to include in file viewports"
         }
       }
     },
@@ -120,7 +125,7 @@
     "test": "vscode-test",
     "clean": "rm -rf out *.tgz",
     "clean:all": "rm -rf out *.tgz node_modules package-lock.json",
-    "rebuild-serializer": "cd crowd-pilot-serializer/crates/napi && npm install && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && npm install"
+    "rebuild-serializer": "cd crowd-pilot-serializer/crates/napi && npm install && rm -f index.d.ts index.js && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && rm -rf node_modules/@crowd-pilot && npm install"
   },
   "dependencies": {
     "@crowd-pilot/serializer": "file:./crowd-pilot-serializer-0.1.0.tgz"
