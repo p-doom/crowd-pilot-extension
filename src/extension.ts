@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
 import { ConversationStateManager, estimateTokens, getDefaultSystemPrompt } from '@crowd-pilot/serializer';
+import { PreviewManager, Action } from './preview';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -118,15 +119,6 @@ function markPendingAsIgnored(): void {
 	}
 }
 
-type Action =
-| { kind: 'showTextDocument' }
-| { kind: 'setSelections', selections: Array<{ start: [number, number], end: [number, number] }> }
-| { kind: 'editInsert', position: [number, number], text: string }
-| { kind: 'editDelete', range: { start: [number, number], end: [number, number] } }
-| { kind: 'editReplace', range: { start: [number, number], end: [number, number] }, text: string }
-| { kind: 'terminalShow' }
-| { kind: 'terminalSendText', text: string }
-| { kind: 'openFile', filePath: string, selections?: Array<{ start: [number, number], end: [number, number] }> };
 
 // Configuration helper
 function getConfig() {
@@ -227,6 +219,9 @@ export function activate(context: vscode.ExtensionContext) {
 		viewportRadius: cfg.viewportRadius,
 	});
 
+	previewManager = new PreviewManager();
+	previewManager.register(context);
+
 	(async () => {
 		const config = vscode.workspace.getConfiguration('terminal.integrated');
 		const commandsToSkipShell = config.get<string[]>('commandsToSkipShell', []);
@@ -237,6 +232,10 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		if (!commandsToSkipShell.includes('crowd-pilot.hideUi')) {
 			commandsToSkipShell.push('crowd-pilot.hideUi');
+			updated = true;
+		}
+		if (!commandsToSkipShell.includes('crowd-pilot.showPendingAction')) {
+			commandsToSkipShell.push('crowd-pilot.showPendingAction');
 			updated = true;
 		}
 		if (updated) {
@@ -293,7 +292,7 @@ export function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		try {
-			if (!previewVisible) { return; }
+			if (!previewManager.isVisible()) { return; }
 			let action: Action | undefined = currentAction;
 			if (!action) {
 				const single = await requestModelActions(editor);
@@ -311,6 +310,24 @@ export function activate(context: vscode.ExtensionContext) {
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
 			vscode.window.showErrorMessage(`Model run failed: ${errorMessage}`);
+		}
+	});
+
+	// Command to show pending action in quick pick (for terminal focus)
+	const showPendingAction = vscode.commands.registerCommand('crowd-pilot.showPendingAction', async () => {
+		if (!currentAction) {
+			vscode.window.showInformationMessage('[crowd-pilot] No pending suggestion');
+			return;
+		}
+		const result = await previewManager.showQuickPick();
+		if (result === 'accept') {
+			recordPreferenceOutcome('accepted');
+			hidePreviewUI(false);
+			await executeAction(currentAction);
+			autoShowNextAction();
+		} else if (result === 'dismiss') {
+			recordPreferenceOutcome('rejected');
+			hidePreviewUI(true);
 		}
 	});
 
@@ -397,6 +414,7 @@ export function activate(context: vscode.ExtensionContext) {
 		openPreferenceLogCmd,
 		sglangTest,
 		modelRun,
+		showPendingAction,
 		onSelChange,
 		onActiveChange,
 		onDocChange,
@@ -415,7 +433,9 @@ export function activate(context: vscode.ExtensionContext) {
 	}
 }
 
-export function deactivate() {}
+export function deactivate() {
+	previewManager?.dispose();
+}
 
 // -------------------- Execution --------------------
 let currentAction: Action | undefined;
@@ -490,11 +510,8 @@ async function executeAction(action: Action): Promise<void> {
 
 // -------------------- UI State & Helpers --------------------
 const UI_CONTEXT_KEY = 'crowdPilot.uiVisible';
-let previewVisible = false;
-let decorationDeleteType: vscode.TextEditorDecorationType | undefined;
-let decorationReplaceType: vscode.TextEditorDecorationType | undefined;
-let decorationReplaceBlockType: vscode.TextEditorDecorationType | undefined;
-let mockStep = 0;
+const HAS_PENDING_ACTION_KEY = 'crowdPilot.hasPendingAction';
+let previewManager: PreviewManager;
 let suppressAutoPreview = false;
 let latestRequestId = 0;
 let currentAbortController: AbortController | undefined;
@@ -509,270 +526,23 @@ let pendingPredictions: PendingPrediction[] = [];
 const cancelledPredictionIds = new Set<number>();
 let lastPredictionTimestamp: number | undefined;
 
-function disposePreviewDecorations() {
-	try { decorationDeleteType?.dispose(); } catch {}
-	try { decorationReplaceType?.dispose(); } catch {}
-	try { decorationReplaceBlockType?.dispose(); } catch {}
-	decorationDeleteType = undefined;
-	decorationReplaceType = undefined;
-	decorationReplaceBlockType = undefined;
-}
-
-function getDynamicMargin(editor: vscode.TextEditor, anchorLine: number, text: string): string {
-	const lines = text.split(/\r?\n/);
-	const height = lines.length;
-	
-	// We need to check the document lines that will be covered by this panel.
-	// The panel starts at 'anchorLine' and extends downwards by 'height' lines.
-	// However, visually, since it's 'after', it sits to the right of 'anchorLine',
-	// and then flows down.
-	// So we check document lines from anchorLine to anchorLine + height - 1.
-	
-	const doc = editor.document;
-	let maxLen = 0;
-	const startLine = anchorLine;
-	const endLine = Math.min(doc.lineCount - 1, anchorLine + height - 1);
-	
-	for (let i = startLine; i <= endLine; i++) {
-		const lineText = doc.lineAt(i).text;
-		const len = lineText.replace(/\t/g, '    ').length;
-		if (len > maxLen) {
-			maxLen = len;
-		}
-	}
-	
-	const anchorLineText = doc.lineAt(anchorLine).text;
-	const anchorLen = anchorLineText.replace(/\t/g, '    ').length;
-	
-	const diff = Math.max(0, maxLen - anchorLen);
-	const margin = diff + 4; 
-	return `${margin}ch`;
-}
-
+/**
+ * Show preview UI for the given action using the PreviewManager.
+ */
 function showPreviewUI(action: Action): void {
-	const editor = vscode.window.activeTextEditor;
-	if (!editor) { return; }
-	disposePreviewDecorations();
-
-	const next = (action.kind === 'editInsert' || action.kind === 'editDelete' || action.kind === 'editReplace' || action.kind === 'terminalSendText' || action.kind === 'setSelections' || action.kind === 'openFile') ? action : undefined;
-	if (!next) {
-		previewVisible = false;
-		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
-		currentAction = action;
-		return;
-	}
-
-	const trimText = (t: string) => {
-		const oneLine = t.replace(/\r?\n/g, '\\n');
-		return oneLine.length > 80 ? oneLine.slice(0, 77) + '…' : oneLine;
-	};
-
-	if (next.kind === 'setSelections') {
-		const selection = next.selections[0];
-		const targetPos = new vscode.Position(selection.start[0], selection.start[1]);
-		const isVisible = editor.visibleRanges.some(r => r.contains(targetPos));
-		
-		let anchorPos = targetPos;
-		let label = "↳ Move Cursor Here";
-
-		if (!isVisible && editor.visibleRanges.length > 0) {
-			const firstVisible = editor.visibleRanges[0].start;
-			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
-			
-			if (targetPos.isBefore(firstVisible)) {
-				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
-			} else {
-				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
-			}
-
-			if (targetPos.line < anchorPos.line) {
-				label = `↑ Move Cursor to Line ${targetPos.line + 1}`;
-			} else {
-				label = `↓ Move Cursor to Line ${targetPos.line + 1}`;
-			}
-		}
-
-		const margin = getDynamicMargin(editor, anchorPos.line, label);
-
-		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-			after: {
-				contentText: '',
-				color: new vscode.ThemeColor('charts.purple'),
-				backgroundColor: new vscode.ThemeColor('editor.background'),
-				fontStyle: 'italic',
-				fontWeight: '600',
-				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${label}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
-			}
-		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
-	} else if (next.kind === 'terminalSendText') {
-		const cursor = editor.selection.active;
-		const isVisible = editor.visibleRanges.some(r => r.contains(cursor));
-		
-		let anchorPos = new vscode.Position(cursor.line, Number.MAX_VALUE);
-		
-		if (!isVisible && editor.visibleRanges.length > 0) {
-			const firstVisible = editor.visibleRanges[0].start;
-			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
-			
-			if (cursor.isBefore(firstVisible)) {
-				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
-			} else {
-				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
-			}
-		}
-		
-		const summary = trimText(next.text || '');
-		const label = `↳ Execute shell command in terminal: ${summary}`;
-		const margin = getDynamicMargin(editor, anchorPos.line, label);
-
-		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-			after: {
-				contentText: '',
-				color: new vscode.ThemeColor('charts.purple'),
-				backgroundColor: new vscode.ThemeColor('editor.background'),
-				fontStyle: 'italic',
-				fontWeight: '600',
-				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${label.replace(/"/g, '\\"')}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
-			}
-		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
-	} else if (next.kind === 'editInsert') {
-		const posLine = next.position[0];
-		const fullBlock = next.text;
-		const cssContent = fullBlock
-			.replace(/"/g, '\\"')
-			.replace(/\r?\n/g, '\\A ');
-
-		const docLineCount = editor.document.lineCount;
-		let anchorLine = posLine;
-		let shiftUp = true;
-		
-		if (anchorLine >= docLineCount) {
-			anchorLine = docLineCount - 1;
-			shiftUp = false;
-		}
-
-		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE); 
-		
-		const marginCheckLine = anchorLine;
-		const margin = getDynamicMargin(editor, marginCheckLine, fullBlock);
-
-		const topOffset = '0';
-
-		const beforeDecoration = {
-			contentText: '',
-			textDecoration: `none; position: absolute; left: 0; width: 100vw; border-top: 1px dashed var(--vscode-charts-purple); top: 0; height: 0; z-index: 99; pointer-events: none;`
-		};
-
-		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-			before: beforeDecoration,
-			after: {
-				contentText: '',
-				color: new vscode.ThemeColor('charts.purple'),
-				backgroundColor: new vscode.ThemeColor('editor.background'),
-				fontStyle: 'italic',
-				fontWeight: '600',
-				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top; top: ${topOffset};`
-			}
-		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
-	} else if (next.kind === 'editDelete') {
-		const range = new vscode.Range(
-			new vscode.Position(next.range.start[0], next.range.start[1]),
-			new vscode.Position(next.range.end[0], next.range.end[1])
-		);
-		decorationDeleteType = vscode.window.createTextEditorDecorationType({
-			backgroundColor: 'rgba(255, 60, 60, 0.18)',
-			border: '1px solid rgba(255, 60, 60, 0.35)',
-			textDecoration: 'line-through'
-		});
-		editor.setDecorations(decorationDeleteType, [{ range }]);
-	} else if (next.kind === 'editReplace') {
-		const range = new vscode.Range(
-			new vscode.Position(next.range.start[0], next.range.start[1]),
-			new vscode.Position(next.range.end[0], next.range.end[1])
-		);
-		decorationReplaceType = vscode.window.createTextEditorDecorationType({
-			backgroundColor: 'rgba(255,165,0,0.15)',
-			border: '1px dashed rgba(255,165,0,0.45)',
-			color: new vscode.ThemeColor('disabledForeground'),
-			textDecoration: 'line-through'
-		});
-		editor.setDecorations(decorationReplaceType, [{ range }]);
-
-		const fullBlock = next.text;
-		
-		const cssContent = fullBlock
-			.replace(/"/g, '\\"')
-			.replace(/\r?\n/g, '\\A '); 
-
-		const anchorLine = range.start.line;
-		const anchorPos = new vscode.Position(anchorLine, Number.MAX_VALUE);
-		const margin = getDynamicMargin(editor, anchorLine, fullBlock);
-
-		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-			after: {
-				contentText: '',
-				color: new vscode.ThemeColor('charts.purple'),
-				backgroundColor: new vscode.ThemeColor('editor.background'),
-				fontStyle: 'italic',
-				fontWeight: '600',
-				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${cssContent}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
-			}
-		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
-	} else if (next.kind === 'openFile') {
-		const cursor = editor.selection.active;
-		const isVisible = editor.visibleRanges.some(r => r.contains(cursor));
-		
-		let anchorPos = new vscode.Position(cursor.line, Number.MAX_VALUE);
-		
-		if (!isVisible && editor.visibleRanges.length > 0) {
-			const firstVisible = editor.visibleRanges[0].start;
-			const lastVisible = editor.visibleRanges[editor.visibleRanges.length - 1].end;
-			
-			if (cursor.isBefore(firstVisible)) {
-				anchorPos = new vscode.Position(firstVisible.line, Number.MAX_VALUE);
-			} else {
-				anchorPos = new vscode.Position(lastVisible.line, Number.MAX_VALUE);
-			}
-		}
-		
-		const fileName = next.filePath.split(/[/\\]/).pop() || next.filePath;
-		const targetLine = next.selections?.[0]?.start[0];
-		const label = targetLine !== undefined
-			? `↳ Switch to file: ${fileName}:${targetLine + 1}` // Display as 1-based
-			: `↳ Switch to file: ${fileName}`;
-		const margin = getDynamicMargin(editor, anchorPos.line, label);
-
-		decorationReplaceBlockType = vscode.window.createTextEditorDecorationType({
-			after: {
-				contentText: '',
-				color: new vscode.ThemeColor('charts.purple'),
-				backgroundColor: new vscode.ThemeColor('editor.background'),
-				fontStyle: 'italic',
-				fontWeight: '600',
-				margin: `0 0 0 ${margin}`,
-				textDecoration: `none; display: inline-block; white-space: pre; content: "${label.replace(/"/g, '\\"')}"; border: 1px solid var(--vscode-charts-purple); padding: 4px; border-radius: 4px; box-shadow: 0 4px 8px rgba(0,0,0,0.25); pointer-events: none; position: relative; z-index: 100; vertical-align: top;`
-			}
-		});
-		editor.setDecorations(decorationReplaceBlockType, [{ range: new vscode.Range(anchorPos, anchorPos) }]);
-	}
-
-	previewVisible = true;
-	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
+	previewManager.show(action);
 	currentAction = action;
+	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
+	vscode.commands.executeCommand('setContext', HAS_PENDING_ACTION_KEY, true);
 }
 
+/**
+ * Hide the preview UI.
+ */
 function hidePreviewUI(suppress?: boolean): void {
-	disposePreviewDecorations();
-	previewVisible = false;
+	previewManager.clear();
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+	vscode.commands.executeCommand('setContext', HAS_PENDING_ACTION_KEY, false);
 	if (suppress) {
 		suppressAutoPreview = true;
 	}
@@ -1006,6 +776,7 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		throw new Error('Empty model content');
 	}
 	const action = parseAction(content, doc);
+	
 	if (!action) {
 		throw new Error('No valid action parsed from model output');
 	}
@@ -1070,7 +841,22 @@ function parseAction(raw: string, doc?: vscode.TextDocument): Action | undefined
 			return viewportAction;
 		}
 	}
-	return { kind: 'terminalSendText', text: normalized };
+	// Sanitize terminal commands for cleaner display
+	const sanitizedCommand = sanitizeCommandForDisplay(normalized);
+	return { kind: 'terminalSendText', text: sanitizedCommand };
+}
+
+/**
+ * Sanitize a command string for display, removing shell artifacts and escaping.
+ */
+function sanitizeCommandForDisplay(cmd: string): string {
+	return cmd
+		.replace(/^-[A-Z]\s*/gm, '')     // Remove stray flag artifacts at line starts
+		.replace(/'\"'\"'/g, "'")         // Fix shell quote escaping
+		.replace(/\\\\/g, '\\')           // Normalize double backslashes
+		.replace(/\\n/g, '\n')            // Convert escaped newlines
+		.replace(/\\t/g, '\t')            // Convert escaped tabs
+		.trim();
 }
 
 /**
@@ -1091,8 +877,9 @@ function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Act
 		return undefined;
 	}
 
-	// Match: sed -i '<script>' <file>
-	const sedMatch = main.match(/sed\s+-i\s+'([\s\S]*?)'\s+([^\s&|]+)\s*$/);
+	// Match: sed with optional flags like -E, -n, -r, followed by -i, then script and file
+	// Handles: sed -i '...' file, sed -E -i '...' file, sed -i -E '...' file, etc.
+	const sedMatch = main.match(/sed\s+(?:-[A-Za-z]+\s+)*-i\s+(?:-[A-Za-z]+\s+)*'([\s\S]*?)'\s+([^\s&|]+)\s*$/);
 	if (!sedMatch) {
 		return undefined;
 	}
