@@ -43,6 +43,10 @@
       {
         "command": "crowd-pilot.openPreferenceLog",
         "title": "crowd-pilot: Open Preference Log"
+      },
+      {
+        "command": "crowd-pilot.showPendingAction",
+        "title": "crowd-pilot: Show Pending Suggestion"
       }
     ],
     "configuration": {
@@ -113,6 +117,12 @@
         "key": "escape",
         "mac": "escape",
         "when": "crowdPilot.uiVisible"
+      },
+      {
+        "command": "crowd-pilot.showPendingAction",
+        "key": "ctrl+,",
+        "mac": "cmd+,",
+        "when": "terminalFocus && crowdPilot.hasPendingAction"
       }
     ]
   },
