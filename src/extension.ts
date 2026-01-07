@@ -140,7 +140,9 @@ function getConfig() {
 
 /**
  * Truncate conversation messages to fit within the context window.
- * Assumes system prompt is the first message. Drops oldest conversation messages first.
+ * Assumes system prompt is the first message.
+ * Uses drop-half strategy: when over budget, drops the first half of conversation
+ * messages to maximize KV cache hits.
  */
 function truncateToContextLimit(
 	messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
@@ -151,26 +153,22 @@ function truncateToContextLimit(
 	const systemTokens = estimateTokens(messages[0].content);
 	const availableTokens = maxTokens - systemTokens;
 
-	const tokenCounts = messages.slice(1).map(m => estimateTokens(m.content));
-	const totalConversationTokens = tokenCounts.reduce((a, b) => a + b, 0);
+	const conversationMessages = messages.slice(1);
+	const totalConversationTokens = conversationMessages.reduce(
+		(sum, m) => sum + estimateTokens(m.content), 0
+	);
 
 	if (totalConversationTokens <= availableTokens) {
 		return messages;
 	}
 
-	let keptTokens = 0;
-	let cutoffIndex = tokenCounts.length;
-	for (let i = tokenCounts.length - 1; i >= 0; i--) {
-		if (keptTokens + tokenCounts[i] <= availableTokens) {
-			keptTokens += tokenCounts[i];
-			cutoffIndex = i;
-		} else {
-			break;
-		}
-	}
+	// Drop first half of conversation messages to maximize KV cache hits
+	const halfIndex = Math.ceil(conversationMessages.length / 2);
+	const keptMessages = conversationMessages.slice(halfIndex);
+	const keptTokens = keptMessages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
 
-	console.log(`[crowd-pilot] Truncated ${cutoffIndex} oldest messages (${systemTokens + totalConversationTokens} -> ${systemTokens + keptTokens} tokens)`);
-	return [messages[0], ...messages.slice(cutoffIndex + 1)];
+	console.log(`[crowd-pilot] Dropped first ${halfIndex} messages (${systemTokens + totalConversationTokens} -> ${systemTokens + keptTokens} tokens)`);
+	return [messages[0], ...keptMessages];
 }
 
 
