@@ -413,19 +413,6 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	});
 
-	const onActiveChange = vscode.window.onDidChangeActiveTextEditor(() => {
-		suppressAutoPreview = false;
-		seedDocumentState();
-		schedulePredictionRefresh(true, false);
-	});
-	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
-		if (vscode.window.activeTextEditor?.document === e.document) {
-			suppressAutoPreview = false;
-			recordDocumentChange(e.document);
-			schedulePredictionRefresh(true, false);
-		}
-	});
-
 	context.subscriptions.push(
 		toggleSuggestions,
 		hideUi,
@@ -456,6 +443,27 @@ type PredictionContext = {
 	cursorLine: number;
 };
 let lastPredictionContext: PredictionContext | null = null;
+
+async function executeAction(action: Action): Promise<void> {
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) { return; }
+	if (action.kind === 'setSelections') {
+		editor.selections = action.selections.map(s => new vscode.Selection(
+			new vscode.Position(s.start[0], s.start[1]),
+			new vscode.Position(s.end[0], s.end[1])
+		));
+		editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		return;
+	}
+	if (action.kind === 'editReplace') {
+		const range = new vscode.Range(
+			new vscode.Position(action.range.start[0], action.range.start[1]),
+			new vscode.Position(action.range.end[0], action.range.end[1])
+		);
+		await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
+		return;
+	}
+}
 
 // -------------------- UI State & Helpers --------------------
 const UI_CONTEXT_KEY = 'crowdPilot.uiVisible';
