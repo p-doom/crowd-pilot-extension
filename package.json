@@ -72,16 +72,6 @@
           "default": "qwen/qwen3-8b",
           "description": "Model name to use for completions"
         },
-        "crowd-pilot.minAvgLogprob": {
-          "type": "number",
-          "default": -1.0,
-          "description": "Minimum average log-probability per token for displaying suggestions. Higher values (closer to 0) require more confidence. -1.0 ≈ perplexity 2.7"
-        },
-        "crowd-pilot.maxContextTokens": {
-          "type": "number",
-          "default": 120000,
-          "description": "Context length (in tokens). Older messages are truncated to fit. Set below your model's limit to leave room for the response."
-        },
         "crowd-pilot.enablePreferenceLogging": {
           "type": "boolean",
           "default": true,
@@ -136,9 +126,6 @@
     "clean": "rm -rf out *.tgz",
     "clean:all": "rm -rf out *.tgz node_modules package-lock.json",
     "rebuild-serializer": "cd crowd-pilot-serializer/crates/napi && npm install && rm -f index.d.ts index.js && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && rm -rf node_modules/@crowd-pilot && npm install"
-  },
-  "dependencies": {
-    "@crowd-pilot/serializer": "file:./crowd-pilot-serializer-0.1.0.tgz"
   },
   "devDependencies": {
     "@types/vscode": "^1.99.3",

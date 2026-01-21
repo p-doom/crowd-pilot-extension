@@ -3,7 +3,6 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
-import { ConversationStateManager, estimateTokens, getDefaultSystemPrompt } from '@crowd-pilot/serializer';
 import { PreviewManager, Action } from './preview';
 
 // -------------------- Preference Data Collection --------------------
@@ -118,8 +117,6 @@ function markPendingAsIgnored(): void {
 		recordPreferenceOutcome('ignored');
 	}
 }
-
-
 // Configuration helper
 function getConfig() {
 	const config = vscode.workspace.getConfiguration('crowd-pilot');
@@ -128,67 +125,42 @@ function getConfig() {
 		port: config.get<number>('port', 30000),
 		basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
-		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
-		maxContextTokens: config.get<number>('maxContextTokens', 120000),
 		preferenceLogPath: config.get<string>('preferenceLogPath', ''),
 		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
 		viewportRadius: config.get<number>('viewportRadius', 10),
 	};
 }
 
-// -------------------- Context Window Management --------------------
+type LineRange = { start: number; end: number };
+type EditHistoryEvent = { oldPath: string; path: string; diff: string };
+type LastEditEvent = {
+	oldText: string;
+	newText: string;
+	editRange: LineRange;
+	lastEditTimeMs: number;
+};
 
-/**
- * Truncate conversation messages to fit within the context window.
- * Assumes system prompt is the first message.
- * Uses drop-half strategy: when over budget, drops the first half of conversation
- * messages to maximize KV cache hits.
- */
-function truncateToContextLimit(
-	messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-	maxTokens: number
-): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
-	if (messages.length === 0) { return messages; }
+const EDIT_HISTORY_LIMIT = 6;
+const CHANGE_GROUPING_LINE_SPAN = 8;
+const LAST_CHANGE_GROUPING_TIME_MS = 1000;
+const DIFF_CONTEXT_LINES = 3;
+const BYTES_PER_TOKEN_GUESS = 3;
+const MAX_EDITABLE_TOKENS = 180;
+const MAX_CONTEXT_TOKENS = 350;
 
-	const systemTokens = estimateTokens(messages[0].content);
-	const availableTokens = maxTokens - systemTokens;
+const fileTextByUri = new Map<string, string>();
+const editHistoryByUri = new Map<string, EditHistoryEvent[]>();
+const lastEditByUri = new Map<string, LastEditEvent>();
 
-	const conversationMessages = messages.slice(1);
-	const totalConversationTokens = conversationMessages.reduce(
-		(sum, m) => sum + estimateTokens(m.content), 0
-	);
-
-	if (totalConversationTokens <= availableTokens) {
-		return messages;
-	}
-
-	// Drop first half of conversation messages to maximize KV cache hits
-	const halfIndex = Math.ceil(conversationMessages.length / 2);
-	const keptMessages = conversationMessages.slice(halfIndex);
-	const keptTokens = keptMessages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
-
-	console.log(`[crowd-pilot] Dropped first ${halfIndex} messages (${systemTokens + totalConversationTokens} -> ${systemTokens + keptTokens} tokens)`);
-	return [messages[0], ...keptMessages];
-}
-
-
-// Global conversation state manager instance
-let conversationManager: ConversationStateManager;
-
-// Track activated files (files whose content we've captured)
-// TODO (f.srambical): This logic remains on the extension-side
-// for backwards-compatibility (with the crowd-code dataset).
-// Eventually, we should move the file tracking logic to
-// p-doom/crowd-pilot-serializer.
-const activatedFiles = new Set<string>();
-
-/**
- * Clear all conversation context - resets the conversation manager and activated files.
- * Call this to start fresh without accumulated history.
- */
 function clearContext(): void {
-	conversationManager.reset();
-	activatedFiles.clear();
+	fileTextByUri.clear();
+	editHistoryByUri.clear();
+	lastEditByUri.clear();
+	currentAction = undefined;
+	lastPredictionContext = null;
+	hidePreviewUI(true);
+	currentAbortController?.abort();
+	currentAbortController = undefined;
 	console.log('[crowd-pilot] Context cleared');
 }
 
@@ -207,16 +179,99 @@ function updateStatusBarItem(): void {
 		statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
 	}
 }
+const TEACHER_PROMPT_TEMPLATE = `# Instructions
+
+You are an edit prediction assistant in a code editor. Your task is to predict the next edit to a given region of code surrounding the user's cursor.
+
+1. Analyze the edit history to understand what the programmer is trying to achieve
+2. Identify any incomplete refactoring or changes that need to be finished
+3. Make the remaining edits that a human programmer would logically make next (by rewriting the code around their cursor)
+
+## Focus on
+
+- Completing any partially-applied changes made
+- Ensuring consistency with the programming style and patterns already established
+- Making edits that maintain or improve code quality
+
+## Rules
+
+- Do not just mechanically apply patterns - reason about what changes make sense given the context and the programmer's apparent goals.
+- Do not just fix syntax errors - look for the broader refactoring pattern and apply it systematically throughout the code.
+- Keep existing formatting unless it's absolutely necessary
+- Don't write a lot of code if you're not sure what to do
+
+# Input Format
+
+You will be provided with:
+1. The user's *edit history*, in chronological order. Use this to infer the user's trajectory and predict the next most logical edit.
+2. A set of *related excerpts* from the user's codebase. Some of these may be needed for correctly predicting the next edit.
+  - \`…\` may appear within a related file to indicate that some code has been skipped.
+3. An excerpt from the user's *current file*.
+    - Within the user's current file, there is an *editable region* delimited by the \`<|editable_region_start|>\` and \`<|editable_region_end|>\` tags. You can only predict edits in this region.
+    - The \`<|user_cursor|>\` tag marks the user's current cursor position, as it stands after the last edit in the history.
+
+# Output Format
+
+- Briefly explain the user's current intent based on the edit history and their current cursor location.
+- Output the entire editable region, applying the edits that you predict the user will make next.
+- If you're unsure some portion of the next edit, you may still predict the surrounding code (such as a function definition, \`for\` loop, etc) and place the \`<|user_cursor|>\` within it for the user to fill in.
+- Wrap the edited code in a codeblock with exactly five backticks.
+
+## Example
+
+### Input
+
+\`\`\`\`\`
+struct Product {
+    name: String,
+    price: u32,
+}
+
+fn calculate_total(products: &[Product]) -> u32 {
+<|editable_region_start|>
+    let mut total = 0;
+    for product in products {
+        total += <|user_cursor|>;
+    }
+    total
+<|editable_region_end|>
+}
+\`\`\`\`\`
+
+### Output
+
+The user is computing a sum based on a list of products. The only numeric field on \`Product\` is \`price\`, so they must intend to sum the prices.
+
+\`\`\`\`\`
+    let mut total = 0;
+    for product in products {
+        total += product.price;
+    }
+    total
+\`\`\`\`\`
+
+# 1. User Edits History
+
+\`\`\`\`\`
+{{edit_history}}
+\`\`\`\`\`
+
+# 2. Related excerpts
+
+{{context}}
+
+# 3. Current File
+
+{{cursor_excerpt}}
+`;
+
+const EDITABLE_REGION_START_LINE = "<|editable_region_start|>";
+const EDITABLE_REGION_END_LINE = "<|editable_region_end|>";
+const USER_CURSOR_MARKER = "<|user_cursor|>";
 
 export function activate(context: vscode.ExtensionContext) {
 
 	console.log('[crowd-pilot] Extension activated');
-
-	const cfg = getConfig();
-	conversationManager = new ConversationStateManager({
-		viewportRadius: cfg.viewportRadius,
-	});
-
 	previewManager = new PreviewManager();
 	previewManager.register(context);
 
@@ -254,8 +309,8 @@ export function activate(context: vscode.ExtensionContext) {
 			hidePreviewUI(true);
 		}
 		vscode.window.showInformationMessage(
-			suggestionsEnabled 
-				? '[crowd-pilot]: Tab suggestions enabled' 
+			suggestionsEnabled
+				? '[crowd-pilot]: Tab suggestions enabled'
 				: '[crowd-pilot]: Tab suggestions disabled'
 		);
 	});
@@ -342,66 +397,19 @@ export function activate(context: vscode.ExtensionContext) {
 		if (e.textEditor === vscode.window.activeTextEditor) {
 			suppressAutoPreview = false;
 			schedulePredictionRefresh(true, false);
-
-			const editor = e.textEditor;
-			const selection = e.selections[0];
-			if (selection) {
-				const filePath = editor.document.uri.fsPath;
-				const offset = editor.document.offsetAt(selection.start);
-				conversationManager.handleSelectionEvent(filePath, offset);
-			}
 		}
 	});
 
-	const onActiveChange = vscode.window.onDidChangeActiveTextEditor((editor) => {
+	const onActiveChange = vscode.window.onDidChangeActiveTextEditor(() => {
 		suppressAutoPreview = false;
+		seedDocumentState();
 		schedulePredictionRefresh(true, false);
-
-		if (editor) {
-			const filePath = editor.document.uri.fsPath;
-			const currentFileUri = editor.document.uri.toString();
-			let tabEventText: string | null = null;
-
-			if (!activatedFiles.has(currentFileUri)) {
-				tabEventText = editor.document.getText();
-				activatedFiles.add(currentFileUri);
-			}
-
-			conversationManager.handleTabEvent(filePath, tabEventText);
-		}
 	});
-
 	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
 		if (vscode.window.activeTextEditor?.document === e.document) {
 			suppressAutoPreview = false;
+			recordDocumentChange(e.document);
 			schedulePredictionRefresh(true, false);
-
-			const filePath = e.document.uri.fsPath;
-			for (const change of e.contentChanges) {
-				const offset = change.rangeOffset;
-				const length = change.rangeLength;
-				const newText = change.text;
-				conversationManager.handleContentEvent(filePath, offset, length, newText);
-			}
-		}
-	});
-
-	// Terminal focus event
-	const onTerminalChange = vscode.window.onDidChangeActiveTerminal((terminal) => {
-		if (terminal) {
-			conversationManager.handleTerminalFocusEvent();
-		}
-	});
-
-	// Terminal command execution event
-	const onTerminalCommand = vscode.window.onDidStartTerminalShellExecution(async (event) => {
-		const commandLine = event.execution.commandLine.value;
-		conversationManager.handleTerminalCommandEvent(commandLine);
-
-		// Capture terminal output
-		const stream = event.execution.read();
-		for await (const data of stream) {
-			conversationManager.handleTerminalOutputEvent(data);
 		}
 	});
 
@@ -415,20 +423,11 @@ export function activate(context: vscode.ExtensionContext) {
 		showPendingAction,
 		onSelChange,
 		onActiveChange,
-		onDocChange,
-		onTerminalChange,
-		onTerminalCommand
+		onDocChange
 	);
 
-	// Initialize: capture current active editor if any
-	const initialEditor = vscode.window.activeTextEditor;
-	if (initialEditor) {
-		const filePath = initialEditor.document.uri.fsPath;
-		const currentFileUri = initialEditor.document.uri.toString();
-		const tabEventText = initialEditor.document.getText();
-		activatedFiles.add(currentFileUri);
-		conversationManager.handleTabEvent(filePath, tabEventText);
-	}
+	seedDocumentState();
+	schedulePredictionRefresh(true, false);
 }
 
 export function deactivate() {
@@ -437,22 +436,17 @@ export function deactivate() {
 
 // -------------------- Execution --------------------
 let currentAction: Action | undefined;
-
-function getActiveOrCreateTerminal(): vscode.Terminal {
-	if (vscode.window.activeTerminal) {
-		return vscode.window.activeTerminal;
-	}
-	return vscode.window.createTerminal('crowd-pilot');
-}
+type PredictionContext = {
+	docUri: string;
+	docVersion: number;
+	editableRange: LineRange;
+	cursorLine: number;
+};
+let lastPredictionContext: PredictionContext | null = null;
 
 async function executeAction(action: Action): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
-	const doc = editor.document;
-	if (action.kind === 'showTextDocument') {
-		await vscode.window.showTextDocument(doc);
-		return;
-	}
 	if (action.kind === 'setSelections') {
 		editor.selections = action.selections.map(s => new vscode.Selection(
 			new vscode.Position(s.start[0], s.start[1]),
@@ -461,47 +455,12 @@ async function executeAction(action: Action): Promise<void> {
 		editor.revealRange(editor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
 		return;
 	}
-	if (action.kind === 'editInsert') {
-		await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
-		return;
-	}
-	if (action.kind === 'editDelete') {
-		const range = new vscode.Range(
-			new vscode.Position(action.range.start[0], action.range.start[1]),
-			new vscode.Position(action.range.end[0], action.range.end[1])
-		);
-		await editor.edit((e: vscode.TextEditorEdit) => e.delete(range));
-		return;
-	}
 	if (action.kind === 'editReplace') {
 		const range = new vscode.Range(
 			new vscode.Position(action.range.start[0], action.range.start[1]),
 			new vscode.Position(action.range.end[0], action.range.end[1])
 		);
 		await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
-		return;
-	}
-	if (action.kind === 'terminalShow') {
-		const term = getActiveOrCreateTerminal();
-		term.show();
-		return;
-	}
-	if (action.kind === 'terminalSendText') {
-		const term = getActiveOrCreateTerminal();
-		term.show();
-		term.sendText(action.text, false);
-		return;
-	}
-	if (action.kind === 'openFile') {
-		const uri = vscode.Uri.file(action.filePath);
-		const openedEditor = await vscode.window.showTextDocument(uri);
-		if (action.selections) {
-			openedEditor.selections = action.selections.map(s => new vscode.Selection(
-				new vscode.Position(s.start[0], s.start[1]),
-				new vscode.Position(s.end[0], s.end[1])
-			));
-			openedEditor.revealRange(openedEditor.selections[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-		}
 		return;
 	}
 }
@@ -523,7 +482,6 @@ let nextQueuedPredictionId = 0;
 let pendingPredictions: PendingPrediction[] = [];
 const cancelledPredictionIds = new Set<number>();
 let lastPredictionTimestamp: number | undefined;
-
 /**
  * Show preview UI for the given action using the PreviewManager.
  */
@@ -546,15 +504,52 @@ function hidePreviewUI(suppress?: boolean): void {
 	}
 }
 
+function canRequestPrediction(editor: vscode.TextEditor, userRequested: boolean): boolean {
+	if (!userRequested && suppressAutoPreview) {
+		return false;
+	}
+	if (!userRequested) {
+		if (!vscode.window.state.focused) {
+			return false;
+		}
+		if (editor.document.getText().length === 0) {
+			return false;
+		}
+		if (editor.selections.some(selection => !selection.isEmpty)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function shouldReuseCurrentPrediction(editor: vscode.TextEditor): boolean {
+	if (!currentAction || !previewManager.isVisible()) {
+		return false;
+	}
+	if (!lastPredictionContext) {
+		return false;
+	}
+	const doc = editor.document;
+	if (doc.uri.toString() !== lastPredictionContext.docUri) {
+		return false;
+	}
+	if (doc.version !== lastPredictionContext.docVersion) {
+		return false;
+	}
+	if (editor.selections.some(selection => !selection.isEmpty)) {
+		return false;
+	}
+	const cursorLine = editor.selection.active.line;
+	return cursorLine >= lastPredictionContext.editableRange.start
+		&& cursorLine <= lastPredictionContext.editableRange.end;
+}
+
 /**
  * Schedule a model preview refresh, coalescing rapid editor events and
  * throttling how often we actually talk to the model.
  */
 function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): void {
 	if (!suggestionsEnabled) {
-		return;
-	}
-	if (!userRequested && suppressAutoPreview) {
 		return;
 	}
 
@@ -564,15 +559,9 @@ function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): v
 		return;
 	}
 
-	if (!userRequested) {
-		if (!vscode.window.state.focused) {
-			hidePreviewUI();
-			return;
-		}
-		if (editor.document.getText().length === 0) {
-			hidePreviewUI();
-			return;
-		}
+	if (!canRequestPrediction(editor, userRequested)) {
+		hidePreviewUI();
+		return;
 	}
 
 	const now = Date.now();
@@ -612,10 +601,179 @@ function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): v
 	}
 }
 
+function seedDocumentState(): void {
+	for (const editor of vscode.window.visibleTextEditors) {
+		const doc = editor.document;
+		const uri = doc.uri.toString();
+		if (!fileTextByUri.has(uri)) {
+			fileTextByUri.set(uri, doc.getText());
+		}
+	}
+}
+
+function recordDocumentChange(doc: vscode.TextDocument): void {
+	const uri = doc.uri.toString();
+	const newText = doc.getText();
+	const oldText = fileTextByUri.get(uri);
+	if (oldText === undefined) {
+		fileTextByUri.set(uri, newText);
+		return;
+	}
+	if (oldText === newText) {
+		return;
+	}
+	const changedRange = computeChangedLineRange(oldText, newText);
+	if (!changedRange) {
+		fileTextByUri.set(uri, newText);
+		return;
+	}
+
+	const nowMs = Date.now();
+	const lastEvent = lastEditByUri.get(uri);
+	if (lastEvent && nowMs - lastEvent.lastEditTimeMs >= LAST_CHANGE_GROUPING_TIME_MS) {
+		finalizeLastEdit(uri, doc.fileName, lastEvent);
+	}
+
+	const updatedLastEvent = lastEditByUri.get(uri);
+	if (
+		updatedLastEvent &&
+		rangesAreNearby(updatedLastEvent.editRange, changedRange, CHANGE_GROUPING_LINE_SPAN)
+	) {
+		updatedLastEvent.newText = newText;
+		updatedLastEvent.editRange = {
+			start: Math.min(updatedLastEvent.editRange.start, changedRange.start),
+			end: Math.max(updatedLastEvent.editRange.end, changedRange.end),
+		};
+		updatedLastEvent.lastEditTimeMs = nowMs;
+		lastEditByUri.set(uri, updatedLastEvent);
+	} else {
+		if (updatedLastEvent) {
+			finalizeLastEdit(uri, doc.fileName, updatedLastEvent);
+		}
+		lastEditByUri.set(uri, {
+			oldText,
+			newText,
+			editRange: changedRange,
+			lastEditTimeMs: nowMs,
+		});
+	}
+
+	fileTextByUri.set(uri, newText);
+}
+
+function finalizeLastEdit(uri: string, filePath: string, lastEvent: LastEditEvent): void {
+	const diff = buildUnifiedDiff(lastEvent.oldText, lastEvent.newText, DIFF_CONTEXT_LINES);
+	if (!diff.trim()) {
+		lastEditByUri.delete(uri);
+		return;
+	}
+	const events = editHistoryByUri.get(uri) ?? [];
+	events.push({ oldPath: filePath, path: filePath, diff });
+	while (events.length > EDIT_HISTORY_LIMIT) {
+		events.shift();
+	}
+	editHistoryByUri.set(uri, events);
+	lastEditByUri.delete(uri);
+}
+
+function rangesAreNearby(a: LineRange, b: LineRange, span: number): boolean {
+	if (a.start <= b.end && b.start <= a.end) {
+		return true;
+	}
+	if (a.start > b.end) {
+		return (a.start - b.end) <= span;
+	}
+	return (b.start - a.end) <= span;
+}
+
+function computeChangedLineRange(oldText: string, newText: string): LineRange | undefined {
+	const oldLines = oldText.split(/\r?\n/);
+	const newLines = newText.split(/\r?\n/);
+	let prefix = 0;
+	while (
+		prefix < oldLines.length &&
+		prefix < newLines.length &&
+		oldLines[prefix] === newLines[prefix]
+	) {
+		prefix += 1;
+	}
+	let suffix = 0;
+	while (
+		suffix < oldLines.length - prefix &&
+		suffix < newLines.length - prefix &&
+		oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+	) {
+		suffix += 1;
+	}
+	if (prefix === oldLines.length && prefix === newLines.length) {
+		return undefined;
+	}
+	const endLine = Math.max(prefix, newLines.length - suffix - 1);
+	return { start: prefix, end: Math.max(prefix, endLine) };
+}
+
+function buildUnifiedDiff(oldText: string, newText: string, contextLines: number): string {
+	const oldLines = oldText.split(/\r?\n/);
+	const newLines = newText.split(/\r?\n/);
+	let prefix = 0;
+	while (
+		prefix < oldLines.length &&
+		prefix < newLines.length &&
+		oldLines[prefix] === newLines[prefix]
+	) {
+		prefix += 1;
+	}
+	let suffix = 0;
+	while (
+		suffix < oldLines.length - prefix &&
+		suffix < newLines.length - prefix &&
+		oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
+	) {
+		suffix += 1;
+	}
+	if (prefix === oldLines.length && prefix === newLines.length) {
+		return "";
+	}
+	const oldStart = Math.max(0, prefix - contextLines);
+	const oldEnd = Math.min(oldLines.length, oldLines.length - suffix + contextLines);
+	const newStart = Math.max(0, prefix - contextLines);
+	const newEnd = Math.min(newLines.length, newLines.length - suffix + contextLines);
+	const oldLen = Math.max(0, oldEnd - oldStart);
+	const newLen = Math.max(0, newEnd - newStart);
+
+	const diffLines: string[] = [];
+	diffLines.push(`@@ -${oldStart + 1},${oldLen} +${newStart + 1},${newLen} @@`);
+
+	const prefixContext = oldLines.slice(oldStart, prefix);
+	for (const line of prefixContext) {
+		diffLines.push(` ${line}`);
+	}
+	const oldChanged = oldLines.slice(prefix, oldLines.length - suffix);
+	for (const line of oldChanged) {
+		diffLines.push(`-${line}`);
+	}
+	const newChanged = newLines.slice(prefix, newLines.length - suffix);
+	for (const line of newChanged) {
+		diffLines.push(`+${line}`);
+	}
+	const suffixContext = oldLines.slice(oldLines.length - suffix, oldEnd);
+	for (const line of suffixContext) {
+		diffLines.push(` ${line}`);
+	}
+
+	return diffLines.join("\n");
+}
 async function autoShowNextAction(): Promise<void> {
 	if (suppressAutoPreview) { return; }
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
+	if (!canRequestPrediction(editor, false)) {
+		hidePreviewUI();
+		return;
+	}
+	if (shouldReuseCurrentPrediction(editor)) {
+		return;
+	}
 	try {
 		currentAbortController?.abort();
 		const controller = new AbortController();
@@ -623,7 +781,14 @@ async function autoShowNextAction(): Promise<void> {
 		const requestId = ++latestRequestId;
 		const next = await requestModelActions(editor, controller.signal);
 		if (requestId !== latestRequestId) { return; }
-		if (next) { showPreviewUI(next); } else { hidePreviewUI(); }
+		if (next) {
+			if (currentAction && previewManager.isVisible() && !shouldReplaceAction(currentAction, next)) {
+				return;
+			}
+			showPreviewUI(next);
+		} else {
+			hidePreviewUI();
+		}
 	} catch (err) {
 		const e = err as any;
 		const isAbort = e?.name === 'AbortError' || /aborted/i.test(String(e?.message ?? ''));
@@ -632,14 +797,43 @@ async function autoShowNextAction(): Promise<void> {
 	}
 }
 
+function shouldReplaceAction(currentAction: Action, nextAction: Action): boolean {
+	if (currentAction.kind !== nextAction.kind) {
+		return true;
+	}
+	if (currentAction.kind === 'editReplace' && nextAction.kind === 'editReplace') {
+		const sameRange =
+			currentAction.range.start[0] === nextAction.range.start[0] &&
+			currentAction.range.start[1] === nextAction.range.start[1] &&
+			currentAction.range.end[0] === nextAction.range.end[0] &&
+			currentAction.range.end[1] === nextAction.range.end[1];
+		if (!sameRange) {
+			return true;
+		}
+		return !nextAction.text.startsWith(currentAction.text);
+	}
+	if (currentAction.kind === 'setSelections' && nextAction.kind === 'setSelections') {
+		const current = currentAction.selections[0];
+		const next = nextAction.selections[0];
+		if (!current || !next) {
+			return true;
+		}
+		return !(
+			current.start[0] === next.start[0] &&
+			current.start[1] === next.start[1] &&
+			current.end[0] === next.end[0] &&
+			current.end[1] === next.end[1]
+		);
+	}
+	return true;
+}
+
 // -------------------- SGLang Client (simple test) --------------------
 async function callSGLangChat(): Promise<void> {
 	const cfg = getConfig();
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
-
-
 	const requestBody: any = {
 		model: cfg.modelName,
 		messages: [
@@ -697,40 +891,28 @@ async function callSGLangChat(): Promise<void> {
 }
 
 // -------------------- Model-planned Actions --------------------
-async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<Action> {
+async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSignal): Promise<Action | undefined> {
 	const cfg = getConfig();
 	const headers: any = {
 		'Content-Type': 'application/json'
 	};
 
-	const doc = editor.document;
-
-	const systemPrompt = getDefaultSystemPrompt(cfg.viewportRadius);
-
-	const accumulatedMessages = conversationManager.finalizeForModel();
-	
-	let conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-		{ role: 'system', content: systemPrompt },
+	const promptContext = buildTeacherPrompt(editor);
+	const conversationMessages = [
+		{ role: 'system', content: promptContext.prompt }
 	];
-	
-	for (const msg of accumulatedMessages) {
-		const role = msg.from === 'User' ? 'user' : 'assistant';
-		conversationMessages.push({ role, content: msg.value });
-	}
-
-	conversationMessages = truncateToContextLimit(conversationMessages, cfg.maxContextTokens);
 
 	const requestBody: any = {
 		model: cfg.modelName,
-		messages: conversationMessages
-	};
-	requestBody.temperature = 0.7;
-	requestBody.top_p = 0.8;
-	requestBody.top_k = 20;
-	requestBody.min_p = 0;
-	requestBody.logprobs = true;
-	requestBody.chat_template_kwargs = {
-		enable_thinking: false
+		messages: conversationMessages,
+		temperature: 0.7,
+		top_p: 0.8,
+		top_k: 20,
+		min_p: 0,
+		logprobs: true,
+		chat_template_kwargs: {
+			enable_thinking: false
+		}
 	};
 
 	const postData = JSON.stringify(requestBody);
@@ -765,19 +947,21 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	});
 
 	const avgLogprob = calculateAverageLogprob(json);
-	if (avgLogprob < cfg.minAvgLogprob) {
-		return undefined as any; // Low confidence, silently skip suggestion
-	}
 
 	const content = extractChatContent(json);
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const action = parseAction(content, doc);
-	
+	const action = parseTeacherResponse(content, promptContext);
 	if (!action) {
-		throw new Error('No valid action parsed from model output');
+		return undefined;
 	}
+	lastPredictionContext = {
+		docUri: promptContext.doc.uri.toString(),
+		docVersion: promptContext.doc.version,
+		editableRange: promptContext.editableRange,
+		cursorLine: promptContext.cursor.line,
+	};
 
 	markPendingAsIgnored();
 
@@ -815,248 +999,263 @@ function extractChatContent(json: any): string | undefined {
  * Returns -Infinity if logprobs are not available.
  */
 function calculateAverageLogprob(json: any): number {
-	const logprobs = json.choices[0]?.logprobs;
-	const sum = logprobs.content.reduce((s: number, t: any) => s + t.logprob, 0);
-	return sum / logprobs.content.length;
+	const logprobs = json?.choices?.[0]?.logprobs;
+	const tokens = logprobs?.content;
+	if (!Array.isArray(tokens) || tokens.length === 0) {
+		return Number.NEGATIVE_INFINITY;
+	}
+	let sum = 0;
+	let count = 0;
+	for (const token of tokens) {
+		if (typeof token.logprob === 'number') {
+			sum += token.logprob;
+			count += 1;
+		}
+	}
+	if (count === 0) {
+		return Number.NEGATIVE_INFINITY;
+	}
+	return sum / count;
 }
 
-function parseAction(raw: string, doc?: vscode.TextDocument): Action | undefined {
-	const command = extractBashCommand(raw);
-	if (!command) {
-		return undefined;
-	}
-	const normalized = command.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-	if (!normalized) {
-		return undefined;
-	}
-	if (doc) {
-		const editAction = parseEditFromSedCommand(normalized, doc);
-		if (editAction) {
-			return editAction;
-		}
-		const viewportAction = parseViewportFromCatCommand(normalized, doc);
-		if (viewportAction) {
-			return viewportAction;
-		}
-	}
-	// Sanitize terminal commands for cleaner display
-	const sanitizedCommand = sanitizeCommandForDisplay(normalized);
-	return { kind: 'terminalSendText', text: sanitizedCommand };
+type PromptContext = {
+	prompt: string;
+	editableRange: LineRange;
+	editableText: string;
+	doc: vscode.TextDocument;
+	cursor: vscode.Position;
+};
+
+function buildTeacherPrompt(editor: vscode.TextEditor): PromptContext {
+	const doc = editor.document;
+	const lines = doc.getText().split(/\r?\n/);
+	const cursor = editor.selection.active;
+	const { editable, context } = computeEditableAndContextRanges(lines, cursor.line);
+
+	const historyEvents = collectEditHistoryForPrompt(doc, doc.uri.toString());
+	const editHistoryText = formatEditHistory(historyEvents);
+	const relatedContextText = formatRelatedContext(doc);
+	const cursorExcerpt = formatCursorExcerpt(doc, editable, context, cursor);
+
+	const prompt = TEACHER_PROMPT_TEMPLATE
+		.replace('{{edit_history}}', editHistoryText)
+		.replace('{{context}}', relatedContextText)
+		.replace('{{cursor_excerpt}}', cursorExcerpt);
+
+	const editableText = lines.slice(editable.start, editable.end + 1).join('\n');
+	return { prompt, editableRange: editable, editableText, doc, cursor };
 }
 
-/**
- * Sanitize a command string for display, removing shell artifacts and escaping.
- */
-function sanitizeCommandForDisplay(cmd: string): string {
-	return cmd
-		.replace(/^-[A-Z]\s*/gm, '')     // Remove stray flag artifacts at line starts
-		.replace(/'\"'\"'/g, "'")         // Fix shell quote escaping
-		.replace(/\\\\/g, '\\')           // Normalize double backslashes
-		.replace(/\\n/g, '\n')            // Convert escaped newlines
-		.replace(/\\t/g, '\t')            // Convert escaped tabs
-		.trim();
+function collectEditHistoryForPrompt(doc: vscode.TextDocument, uri: string): EditHistoryEvent[] {
+	const events = [...(editHistoryByUri.get(uri) ?? [])];
+	const lastEvent = lastEditByUri.get(uri);
+	if (lastEvent) {
+		const diff = buildUnifiedDiff(lastEvent.oldText, lastEvent.newText, DIFF_CONTEXT_LINES);
+		if (diff.trim()) {
+			events.push({ oldPath: doc.fileName, path: doc.fileName, diff });
+		}
+	}
+	return events.slice(-EDIT_HISTORY_LIMIT);
 }
 
-/**
- * Parse a sed-based edit command of the form emitted by the NeMo serializer into a VS Code edit action.
- *
- * Supported patterns (1-based line numbers, mirroring serialization_utils.py):
- *   sed -i 'START,ENDc\n<replacement...>' <file>     -> editReplace
- *   sed -i 'START,ENDd' <file>                      -> editDelete
- *   sed -i 'STARTi\n<insert...>' <file>             -> editInsert (before START)
- *   sed -i '$a\n<append...>' <file>                 -> editInsert (append at EOF)
- *
- * If the command does not match these patterns, returns undefined.
- */
-function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Action | undefined {
-	// Only consider the first command before && / ||, since cat -n etc. are for viewport only.
-	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
-	if (!main) {
-		return undefined;
+function formatEditHistory(events: EditHistoryEvent[]): string {
+	if (events.length === 0) {
+		return "(No edit history)";
 	}
-
-	// Match: sed with optional flags like -E, -n, -r, followed by -i, then script and file
-	// Handles: sed -i '...' file, sed -E -i '...' file, sed -i -E '...' file, etc.
-	const sedMatch = main.match(/sed\s+(?:-[A-Za-z]+\s+)*-i\s+(?:-[A-Za-z]+\s+)*'([\s\S]*?)'\s+([^\s&|]+)\s*$/);
-	if (!sedMatch) {
-		return undefined;
-	}
-	const script = sedMatch[1] ?? '';
-	const targetFile = sedMatch[2] ?? '';
-	const activePath = doc.uri.fsPath;
-	if (targetFile !== activePath) {
-		return undefined;
-	}
-
-	// Delete: "START,ENDd"
-	const deleteMatch = script.match(/^(\d+),(\d+)d$/);
-	if (deleteMatch) {
-		const startLine1 = Number(deleteMatch[1]);
-		const endLine1 = Number(deleteMatch[2]);
-		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
-			return undefined;
-		}
-		const startLine0 = Math.max(0, startLine1 - 1);
-		const endLine0 = Math.max(0, endLine1 - 1);
-
-		let endPosLine = endLine0 + 1;
-		let endPosChar = 0;
-		if (endPosLine >= doc.lineCount) {
-			endPosLine = doc.lineCount - 1;
-			endPosChar = doc.lineAt(endPosLine).range.end.character;
-		}
-		return {
-			kind: 'editDelete',
-			range: {
-				start: [startLine0, 0],
-				end: [endPosLine, endPosChar],
-			},
-		};
-	}
-
-	// Replace: "START,ENDc\newline<payload...>"
-	const replaceMatch = script.match(/^(\d+),(\d+)c\\\n([\s\S]*)$/);
-	if (replaceMatch) {
-		const startLine1 = Number(replaceMatch[1]);
-		const endLine1 = Number(replaceMatch[2]);
-		let payload = replaceMatch[3] ?? '';
-		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
-			return undefined;
-		}
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const startLine0 = Math.max(0, startLine1 - 1);
-		const endLine0 = Math.max(0, endLine1 - 1);
-		const startPos: [number, number] = [startLine0, 0];
-
-		let endPosLine = endLine0 + 1;
-		let endPosChar = 0;
-		if (endPosLine >= doc.lineCount) {
-			endPosLine = doc.lineCount - 1;
-			endPosChar = doc.lineAt(endPosLine).range.end.character;
-		}
-
-		const text = payload.endsWith('\n') ? payload : payload + '\n';
-		return {
-			kind: 'editReplace',
-			range: { start: startPos, end: [endPosLine, endPosChar] },
-			text,
-		};
-	}
-
-	const insertMatch = script.match(/^(\d+)i\\\n([\s\S]*)$/);
-	if (insertMatch) {
-		const line1 = Number(insertMatch[1]);
-		let payload = insertMatch[2] ?? '';
-		if (!Number.isFinite(line1)) {
-			return undefined;
-		}
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const insertLine0 = Math.max(0, line1 - 1);
-		const position: [number, number] = [insertLine0, 0];
-		const text = payload.endsWith('\n') ? payload : payload + '\n';
-		return {
-			kind: 'editInsert',
-			position,
-			text,
-		};
-	}
-
-	const appendMatch = script.match(/^\$a\\\n([\s\S]*)$/);
-	if (appendMatch) {
-		let payload = appendMatch[1] ?? '';
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const insertLine0 = doc.lineCount;
-		const position: [number, number] = [insertLine0, 0];
-		const needsLeadingNewline = doc.lineCount > 0;
-		const base = payload.endsWith('\n') ? payload : payload + '\n';
-		const text = needsLeadingNewline ? '\n' + base : base;
-		return {
-			kind: 'editInsert',
-			position,
-			text,
-		};
-	}
-
-	return undefined;
+	return events
+		.map((event) => `--- a/${event.oldPath}\n+++ b/${event.path}\n${event.diff}`)
+		.join("\n");
 }
 
-/**
- * Parse viewport / selection commands of the form:
- *   cat -n <file> | sed -n 'START,ENDp'
- *
- * into a lightweight VS Code selection move (setSelections). This mirrors how
- * selection and viewport events are serialized in serialization_utils.py.
- */
-function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument): Action | undefined {
-	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
-	if (!main) {
-		return undefined;
+function formatRelatedContext(currentDoc: vscode.TextDocument): string {
+	const relatedEditors = vscode.window.visibleTextEditors.filter(
+		(editor) => editor.document.uri.toString() !== currentDoc.uri.toString(),
+	);
+	if (relatedEditors.length === 0) {
+		return "(No context)";
 	}
 
-	// Simple file-open: cat -n <file>
-	const simpleCatMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*$/);
-	if (simpleCatMatch) {
-		const targetFile = simpleCatMatch[1] ?? '';
-		if (targetFile !== doc.uri.fsPath) {
-			return { kind: 'openFile', filePath: targetFile };
+	const blocks: string[] = [];
+	for (const editor of relatedEditors) {
+		const doc = editor.document;
+		const path = doc.fileName;
+		const totalLines = doc.lineCount;
+		const cursorLine = editor.selection.active.line;
+		const radius = 10;
+		const start = Math.max(0, cursorLine - radius);
+		const end = Math.min(totalLines - 1, cursorLine + radius);
+		const excerptLines: string[] = [];
+
+		if (start > 0) {
+			excerptLines.push("…");
 		}
-		// Ensure the active document is visible; rely on existing editor to handle this.
-		return { kind: 'showTextDocument' };
+		for (let line = start; line <= end; line += 1) {
+			excerptLines.push(doc.lineAt(line).text);
+		}
+		if (end < totalLines - 1) {
+			excerptLines.push("…");
+		}
+
+		const block = [
+			`\`\`\`\`\`${path}`,
+			excerptLines.join("\n"),
+			"",
+			"`````",
+		].join("\n");
+		blocks.push(block);
 	}
 
-	// Viewport slice: cat -n <file> | sed -n 'START,ENDp'
-	const viewportMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*\|\s*sed\s+-n\s+'(\d+),(\d+)p'\s*$/);
-	if (!viewportMatch) {
+	return blocks.join("\n");
+}
+
+function formatCursorExcerpt(
+	doc: vscode.TextDocument,
+	editable: LineRange,
+	context: LineRange,
+	cursor: vscode.Position,
+): string {
+	const lines = doc.getText().split(/\r?\n/);
+	const contextStart = Math.max(0, context.start);
+	const contextEnd = Math.min(lines.length - 1, context.end);
+	const excerptLines = lines.slice(contextStart, contextEnd + 1);
+
+	const cursorIndex = cursor.line - contextStart;
+	if (cursorIndex >= 0 && cursorIndex < excerptLines.length) {
+		const lineText = excerptLines[cursorIndex];
+		const charIndex = Math.min(cursor.character, lineText.length);
+		excerptLines[cursorIndex] =
+			lineText.slice(0, charIndex) + USER_CURSOR_MARKER + lineText.slice(charIndex);
+	}
+
+	const editableStartIndex = editable.start - contextStart;
+	const editableEndIndex = editable.end - contextStart;
+	const startInsertIndex = Math.max(0, Math.min(excerptLines.length, editableStartIndex));
+	excerptLines.splice(startInsertIndex, 0, EDITABLE_REGION_START_LINE);
+	const endInsertIndex = Math.max(0, Math.min(excerptLines.length, editableEndIndex + 2));
+	excerptLines.splice(endInsertIndex, 0, EDITABLE_REGION_END_LINE);
+
+	return `\`\`\`\`\`${doc.fileName}\n${excerptLines.join("\n")}\n\`\`\`\`\``;
+}
+
+function computeEditableAndContextRanges(
+	lines: string[],
+	cursorLine: number,
+): { editable: LineRange; context: LineRange } {
+	const clampedLine = Math.max(0, Math.min(cursorLine, Math.max(0, lines.length - 1)));
+	const cursorRange = { start: clampedLine, end: clampedLine };
+	const editable = expandLineRange(lines, cursorRange, MAX_EDITABLE_TOKENS);
+	const context = expandLineRange(lines, editable, MAX_CONTEXT_TOKENS);
+	return { editable, context };
+}
+
+function expandLineRange(lines: string[], base: LineRange, tokenLimit: number): LineRange {
+	let start = Math.max(0, base.start);
+	let end = Math.min(lines.length - 1, base.end);
+	let remaining = tokenLimit;
+
+	for (let line = start; line <= end; line += 1) {
+		remaining -= lineTokenGuess(lines[line]);
+	}
+	remaining = Math.max(0, remaining);
+
+	while (remaining > 0) {
+		let expanded = false;
+		if (start > 0 && remaining > 0) {
+			start -= 1;
+			remaining -= lineTokenGuess(lines[start]);
+			expanded = true;
+		}
+		if (end < lines.length - 1 && remaining > 0) {
+			end += 1;
+			remaining -= lineTokenGuess(lines[end]);
+			expanded = true;
+		}
+		if (!expanded) {
+			break;
+		}
+	}
+
+	return { start, end };
+}
+
+function lineTokenGuess(line: string): number {
+	const bytes = Buffer.byteLength(line, "utf8");
+	return Math.max(1, Math.floor(bytes / BYTES_PER_TOKEN_GUESS));
+}
+
+function parseTeacherResponse(raw: string, context: PromptContext): Action | undefined {
+	const codeBlock = extractLastCodeBlock(raw);
+	if (!codeBlock) {
 		return undefined;
 	}
+	const cleaned = stripEditableMarkers(codeBlock);
+	let newEditableText = cleaned.replace(new RegExp(USER_CURSOR_MARKER, "g"), "");
+	if (context.editableText.endsWith("\n") && !newEditableText.endsWith("\n")) {
+		newEditableText += "\n";
+	}
+	if (context.editableText === newEditableText) {
+		return undefined;
+	}
+	const changeRange = computeChangedLineRange(context.editableText, newEditableText);
+	if (!changeRange) {
+		return undefined;
+	}
+	const absoluteStart = context.editableRange.start + changeRange.start;
+	const absoluteEnd = context.editableRange.start + changeRange.end;
+	const cursorLine = context.cursor.line;
 
-	const targetFile = viewportMatch[1] ?? '';
-	const startStr = viewportMatch[2] ?? '';
-	const endStr = viewportMatch[3] ?? '';
-
-	const startLine1 = Number(startStr);
-	const endLine1 = Number(endStr);
-
-	// Place the cursor in the middle of the viewport (1-based to 0-based).
-	const center1 = Math.floor((startLine1 + endLine1) / 2);
-	const center0 = Math.max(0, center1 - 1);
-
-	if (targetFile !== doc.uri.fsPath) {
+	if (cursorLine < absoluteStart - 2 || cursorLine > absoluteEnd + 2) {
+		const targetLine = Math.max(0, Math.min(absoluteStart, context.doc.lineCount - 1));
 		return {
-			kind: 'openFile',
-			filePath: targetFile,
-			selections: [{ start: [center0, 0], end: [center0, 0] }]
+			kind: "setSelections",
+			selections: [{ start: [targetLine, 0], end: [targetLine, 0] }],
 		};
 	}
-	const lastLine = Math.max(0, doc.lineCount - 1);
-	const line = Math.min(center0, lastLine);
 
+	const endLine = Math.min(context.editableRange.end, context.doc.lineCount - 1);
+	const endChar = context.doc.lineAt(endLine).range.end.character;
 	return {
-		kind: 'setSelections',
-		selections: [
-			{
-				start: [line, 0],
-				end: [line, 0],
-			},
-		],
+		kind: "editReplace",
+		range: { start: [context.editableRange.start, 0], end: [endLine, endChar] },
+		text: newEditableText,
 	};
 }
 
-function extractBashCommand(raw: string): string | undefined {
-	if (!raw) {
-		return undefined;
+function stripEditableMarkers(text: string): string {
+	const lines = text.split(/\r?\n/);
+	const filtered = lines.filter((line) => {
+		const trimmed = line.trim();
+		return trimmed !== EDITABLE_REGION_START_LINE && trimmed !== EDITABLE_REGION_END_LINE;
+	});
+	return filtered.join("\n");
+}
+
+function extractLastCodeBlock(text: string): string | undefined {
+	let lastBlock: string | undefined;
+	let searchStart = 0;
+
+	while (true) {
+		const start = text.indexOf("```", searchStart);
+		if (start === -1) {
+			break;
+		}
+		let end = start;
+		while (end < text.length && text[end] === "`") {
+			end += 1;
+		}
+		const fence = text.slice(start, end);
+		const lineBreak = text.indexOf("\n", end);
+		if (lineBreak === -1) {
+			break;
+		}
+		const closing = text.indexOf(`\n${fence}`, lineBreak + 1);
+		if (closing === -1) {
+			searchStart = end;
+			continue;
+		}
+		lastBlock = text.slice(lineBreak + 1, closing + 1);
+		searchStart = closing + fence.length + 1;
 	}
-	const trimmed = raw.trim();
-	const fenceMatch = trimmed.match(/```(?:bash)?\s*([\s\S]*?)```/i);
-	if (fenceMatch && fenceMatch[1]) {
-		return fenceMatch[1];
-	}
-	// Fallback: treat entire response as the command
-	return trimmed.length > 0 ? trimmed : undefined;
+
+	return lastBlock?.trim();
 }
