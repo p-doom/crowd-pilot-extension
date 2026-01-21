@@ -72,16 +72,6 @@
           "default": "qwen/qwen3-8b",
           "description": "Model name to use for completions"
         },
-        "crowd-pilot.minAvgLogprob": {
-          "type": "number",
-          "default": -1.0,
-          "description": "Minimum average log-probability per token for displaying suggestions. Higher values (closer to 0) require more confidence. -1.0 ≈ perplexity 2.7"
-        },
-        "crowd-pilot.maxContextTokens": {
-          "type": "number",
-          "default": 120000,
-          "description": "Context length (in tokens). Older messages are truncated to fit. Set below your model's limit to leave room for the response."
-        },
         "crowd-pilot.enablePreferenceLogging": {
           "type": "boolean",
           "default": true,

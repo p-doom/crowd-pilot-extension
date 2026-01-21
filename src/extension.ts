@@ -125,7 +125,6 @@ function getConfig() {
 		port: config.get<number>('port', 30000),
 		basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
-		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
 		preferenceLogPath: config.get<string>('preferenceLogPath', ''),
 		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
 		viewportRadius: config.get<number>('viewportRadius', 10),
@@ -158,6 +157,7 @@ function clearContext(): void {
 	editHistoryByUri.clear();
 	lastEditByUri.clear();
 	currentAction = undefined;
+	lastPredictionContext = null;
 	hidePreviewUI(true);
 	currentAbortController?.abort();
 	currentAbortController = undefined;
@@ -449,6 +449,13 @@ export function deactivate() {
 
 // -------------------- Execution --------------------
 let currentAction: Action | undefined;
+type PredictionContext = {
+	docUri: string;
+	docVersion: number;
+	editableRange: LineRange;
+	cursorLine: number;
+};
+let lastPredictionContext: PredictionContext | null = null;
 
 // -------------------- UI State & Helpers --------------------
 const UI_CONTEXT_KEY = 'crowdPilot.uiVisible';
@@ -489,15 +496,52 @@ function hidePreviewUI(suppress?: boolean): void {
 	}
 }
 
+function canRequestPrediction(editor: vscode.TextEditor, userRequested: boolean): boolean {
+	if (!userRequested && suppressAutoPreview) {
+		return false;
+	}
+	if (!userRequested) {
+		if (!vscode.window.state.focused) {
+			return false;
+		}
+		if (editor.document.getText().length === 0) {
+			return false;
+		}
+		if (editor.selections.some(selection => !selection.isEmpty)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function shouldReuseCurrentPrediction(editor: vscode.TextEditor): boolean {
+	if (!currentAction || !previewManager.isVisible()) {
+		return false;
+	}
+	if (!lastPredictionContext) {
+		return false;
+	}
+	const doc = editor.document;
+	if (doc.uri.toString() !== lastPredictionContext.docUri) {
+		return false;
+	}
+	if (doc.version !== lastPredictionContext.docVersion) {
+		return false;
+	}
+	if (editor.selections.some(selection => !selection.isEmpty)) {
+		return false;
+	}
+	const cursorLine = editor.selection.active.line;
+	return cursorLine >= lastPredictionContext.editableRange.start
+		&& cursorLine <= lastPredictionContext.editableRange.end;
+}
+
 /**
  * Schedule a model preview refresh, coalescing rapid editor events and
  * throttling how often we actually talk to the model.
  */
 function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): void {
 	if (!suggestionsEnabled) {
-		return;
-	}
-	if (!userRequested && suppressAutoPreview) {
 		return;
 	}
 
@@ -507,15 +551,9 @@ function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): v
 		return;
 	}
 
-	if (!userRequested) {
-		if (!vscode.window.state.focused) {
-			hidePreviewUI();
-			return;
-		}
-		if (editor.document.getText().length === 0) {
-			hidePreviewUI();
-			return;
-		}
+	if (!canRequestPrediction(editor, userRequested)) {
+		hidePreviewUI();
+		return;
 	}
 
 	const now = Date.now();
@@ -721,6 +759,13 @@ async function autoShowNextAction(): Promise<void> {
 	if (suppressAutoPreview) { return; }
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
+	if (!canRequestPrediction(editor, false)) {
+		hidePreviewUI();
+		return;
+	}
+	if (shouldReuseCurrentPrediction(editor)) {
+		return;
+	}
 	try {
 		currentAbortController?.abort();
 		const controller = new AbortController();
@@ -894,9 +939,6 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	});
 
 	const avgLogprob = calculateAverageLogprob(json);
-	if (Number.isFinite(avgLogprob) && avgLogprob < cfg.minAvgLogprob) {
-		return undefined;
-	}
 
 	const content = extractChatContent(json);
 	if (typeof content !== 'string' || content.trim().length === 0) {
@@ -906,6 +948,12 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	if (!action) {
 		return undefined;
 	}
+	lastPredictionContext = {
+		docUri: promptContext.doc.uri.toString(),
+		docVersion: promptContext.doc.version,
+		editableRange: promptContext.editableRange,
+		cursorLine: promptContext.cursor.line,
+	};
 
 	markPendingAsIgnored();
 
