@@ -14,6 +14,7 @@ vsc-extension-quickstart.md
 *.md
 !readme.md
 !changelog.md
+node_modules/**
 .venv
 
 # Submodule source (native addon is in the tarball)
