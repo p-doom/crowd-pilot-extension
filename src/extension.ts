@@ -714,8 +714,8 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	];
 	
 	for (const msg of accumulatedMessages) {
-		const role = msg.from === 'User' ? 'user' : 'assistant';
-		conversationMessages.push({ role, content: msg.value });
+		const role = msg.role === 'user' ? 'user' : 'assistant';
+		conversationMessages.push({ role, content: msg.content });
 	}
 
 	conversationMessages = truncateToContextLimit(conversationMessages, cfg.maxContextTokens);
