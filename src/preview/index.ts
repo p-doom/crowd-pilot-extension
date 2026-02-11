@@ -5,6 +5,7 @@ import { CrowdPilotInlineProvider } from './inlineProvider';
 import { MetaActionHoverProvider } from './hoverProvider';
 import { showPendingActionQuickPick, QuickPickResult } from './quickPick';
 import { computeDeletionRanges, hasInsertions, analyzeCoherentReplacement, analyzePureInsertion } from '../utils/diff';
+import { computeMinimalChangeRange } from '../utils/parsing';
 
 // Re-export types
 export { Action, toVscodeRange, toVscodePosition, truncate } from './types';
@@ -183,11 +184,8 @@ export class PreviewManager {
     }
 
     /**
-     * Show preview for text replacement using decorations.
-     * Case 1: Pure insertion (no deletions) → show only inserted text inline in green
-     * Case 2: Has deletions → decorations (red deletion + green addition)
-     *         - If coherent (single substring replacement): show green inline after red
-     *         - If not coherent (scattered changes): show green block on next line
+     * Show preview for text replacement.
+     * Uses inline ghost text for multi-line insertions/replacements.
      */
     private showReplacePreview(action: { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }, editor?: vscode.TextEditor): void {
         if (!editor) {
@@ -200,8 +198,10 @@ export class PreviewManager {
         // Case 1: Check for pure insertion first (no deletions)
         const pureInsertion = analyzePureInsertion(editor.document, range, action.text);
         if (pureInsertion.isPureInsertion && pureInsertion.insertionPosition && pureInsertion.insertionText) {
-            // Pure insertion: show only the new text inline in green (no red)
-            this.showInlineInsertion(editor, pureInsertion.insertionPosition, pureInsertion.insertionText);
+            this.inlineProvider.setInlineReplace({
+                position: pureInsertion.insertionPosition,
+                text: pureInsertion.insertionText
+            });
         } else {
             // Case 2: Has deletions - show red strikethrough
             const deletionRanges = computeDeletionRanges(editor.document, range, action.text);
@@ -219,15 +219,24 @@ export class PreviewManager {
             // Green highlight on text being added - only if there's actual new content
             // Don't show if it's purely a deletion (new text is subset of old text)
             if (hasInsertions(oldText, action.text)) {
-                // Check if this is a coherent single-substring replacement
                 const coherent = analyzeCoherentReplacement(editor.document, range, action.text);
                 
                 if (coherent.isCoherent && coherent.deletionRange && coherent.insertionText) {
-                    // Coherent: show green text inline right after the red deletion
-                    this.showInlineInsertion(editor, coherent.deletionRange.end, coherent.insertionText);
+                    this.inlineProvider.setInlineReplace({
+                        position: coherent.deletionRange.end,
+                        text: coherent.insertionText
+                    });
                 } else {
-                    // Not coherent: show green block on next line
-                    this.showInsertionBlock(editor, range.end.line, action.text);
+                    // Not coherent: show only the minimal changed replacement chunk.
+                    const minimalChange = computeMinimalChangeRange(oldText, action.text);
+                    if (minimalChange) {
+                        const changeStartLine = range.start.line + minimalChange.oldStart;
+                        const changeStartPos = new vscode.Position(changeStartLine, 0);
+                        this.inlineProvider.setInlineReplace({
+                            position: changeStartPos,
+                            text: minimalChange.newText
+                        });
+                    }
                 }
             }
         }
@@ -238,57 +247,31 @@ export class PreviewManager {
 
     /**
      * Show inserted text inline at a specific position (right after deleted text).
-     * Used for coherent single-substring replacements.
      */
     private showInlineInsertion(editor: vscode.TextEditor, position: vscode.Position, text: string): void {
-        // Format text for display
-        const displayText = text.replace(/\n/g, '↵').replace(/\t/g, '→');
-        const truncatedText = truncate(displayText, 60);
-        
-        const decorationOptions: vscode.DecorationOptions[] = [{
-            range: new vscode.Range(position, position),
-            renderOptions: {
-                after: {
-                    contentText: truncatedText,
-                    color: COLORS.insertion.foreground,
-                    backgroundColor: COLORS.insertion.background,
-                    fontStyle: 'normal',
-                    border: '1px solid',
-                    borderColor: COLORS.insertion.border,
-                }
-            }
-        }];
-
-        this.decorationPool.setDecorations(editor, 'insertion-inline', decorationOptions);
+        if (!text.trim()) {
+            return;
+        }
+        this.inlineProvider.setInlineReplace({
+            position,
+            text
+        });
     }
 
     /**
      * Show the new/inserted text with green highlight as a block after the specified line.
      */
     private showInsertionBlock(editor: vscode.TextEditor, afterLine: number, text: string): void {
+        if (!text.trim()) {
+            return;
+        }
         const anchorLine = Math.min(afterLine, editor.document.lineCount - 1);
-        const anchorPos = new vscode.Position(anchorLine, Number.MAX_SAFE_INTEGER);
-        
-        // Format text for display (escape for CSS content)
-        const displayText = text.replace(/\n/g, '↵').replace(/\t/g, '→');
-        const truncatedText = truncate(displayText, 80);
-        
-        const decorationOptions: vscode.DecorationOptions[] = [{
-            range: new vscode.Range(anchorPos, anchorPos),
-            renderOptions: {
-                after: {
-                    contentText: `  + ${truncatedText}`,
-                    color: COLORS.insertion.foreground,
-                    backgroundColor: COLORS.insertion.background,
-                    fontStyle: 'normal',
-                    margin: '0 0 0 2ch',
-                    border: '1px solid',
-                    borderColor: COLORS.insertion.border,
-                }
-            }
-        }];
-
-        this.decorationPool.setDecorations(editor, 'insertion-block', decorationOptions);
+        const lineLength = editor.document.lineAt(anchorLine).text.length;
+        const position = new vscode.Position(anchorLine, lineLength);
+        this.inlineProvider.setInlineReplace({
+            position,
+            text
+        });
     }
 
     /**
@@ -433,4 +416,3 @@ export class PreviewManager {
     }
 
 }
-

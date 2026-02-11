@@ -74,13 +74,13 @@
         },
         "crowd-pilot.minAvgLogprob": {
           "type": "number",
-          "default": -1.0,
+          "default": -1,
           "description": "Minimum average log-probability per token for displaying suggestions. Higher values (closer to 0) require more confidence. -1.0 ≈ perplexity 2.7"
         },
-        "crowd-pilot.maxContextTokens": {
-          "type": "number",
-          "default": 120000,
-          "description": "Context length (in tokens). Older messages are truncated to fit. Set below your model's limit to leave room for the response."
+        "crowd-pilot.enableModelLogging": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log model prompts and responses to <preference-log-dir>/model-logs for debugging"
         },
         "crowd-pilot.enablePreferenceLogging": {
           "type": "boolean",
@@ -92,10 +92,33 @@
           "default": "",
           "description": "Custom path for the preference log file (JSONL format). If empty, uses workspace/.crowd-pilot-preferences.jsonl"
         },
-        "crowd-pilot.viewportRadius": {
+        "crowd-pilot.sweepViewportLines": {
           "type": "number",
-          "default": 10,
-          "description": "Number of lines above/below cursor to include in file viewports"
+          "default": 21,
+          "description": "Fixed viewport line count for Sweep target/history windows"
+        },
+        "crowd-pilot.sweepOpenedFileContext": {
+          "type": "string",
+          "enum": [
+            "full",
+            "viewport"
+          ],
+          "default": "full",
+          "description": "How opened non-target files are included in Sweep context"
+        },
+        "crowd-pilot.sweepHistoryCenter": {
+          "type": "string",
+          "enum": [
+            "changed",
+            "cursor"
+          ],
+          "default": "changed",
+          "description": "How Sweep history windows are centered"
+        },
+        "crowd-pilot.sweepMaxHistoryEntries": {
+          "type": "number",
+          "default": 64,
+          "description": "Maximum number of historical Sweep diff windows retained in runtime context"
         }
       }
     },
@@ -133,6 +156,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
+    "test:unit": "npm run compile && mocha --ui tdd out/test/parsing.test.js out/test/sweepAction.test.js",
     "clean": "rm -rf out *.tgz",
     "clean:all": "rm -rf out *.tgz node_modules package-lock.json",
     "rebuild-serializer": "rm -f crowd-pilot-serializer-*.tgz && cd crowd-pilot-serializer/crates/napi && npm install && rm -f index.d.ts index.js && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && rm -rf node_modules/@crowd-pilot && npm install"
@@ -141,14 +165,15 @@
     "@crowd-pilot/serializer": "file:./crowd-pilot-serializer-0.1.0.tgz"
   },
   "devDependencies": {
-    "@types/vscode": "^1.99.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
+    "@types/vscode": "^1.99.3",
     "@typescript-eslint/eslint-plugin": "^8.45.0",
     "@typescript-eslint/parser": "^8.45.0",
-    "eslint": "^9.36.0",
-    "typescript": "^5.9.3",
     "@vscode/test-cli": "^0.0.11",
-    "@vscode/test-electron": "^2.5.2"
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.36.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.9.3"
   }
 }

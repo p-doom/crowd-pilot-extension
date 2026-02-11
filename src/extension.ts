@@ -3,8 +3,9 @@ import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
-import { ConversationStateManager, estimateTokens, getDefaultSystemPrompt } from '@crowd-pilot/serializer';
+import { SweepConversationStateManager } from '@crowd-pilot/serializer';
 import { PreviewManager, Action } from './preview';
+import { parsedSweepEditToAction, SweepParsedEdit } from './utils/sweepAction';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -38,6 +39,40 @@ function getPreferenceLogPath(): string {
 		return path.join(workspaceFolders[0].uri.fsPath, '.crowd-pilot-preferences.jsonl');
 	}
 	throw new Error("No preference log path found.");
+}
+
+function getPreferenceLogDir(): string {
+	return path.dirname(getPreferenceLogPath());
+}
+
+function createModelLogId(): string {
+	return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function writeModelLog(id: string, contents: string, append: boolean): Promise<void> {
+	const cfg = getConfig();
+	if (!cfg.enableModelLogging) {
+		return;
+	}
+	const baseDir = getPreferenceLogDir();
+	const dir = path.join(baseDir, 'model-logs');
+	await fs.promises.mkdir(dir, { recursive: true });
+	const filePath = path.join(dir, `${id}.txt`);
+	if (append) {
+		await fs.promises.appendFile(filePath, contents, 'utf8');
+	} else {
+		await fs.promises.writeFile(filePath, contents, 'utf8');
+	}
+}
+
+async function logModelPrompt(id: string, prompt: string): Promise<void> {
+	const contents = `=== Prompt ===\n${prompt}\n\n`;
+	await writeModelLog(id, contents, false);
+}
+
+async function logModelResponse(id: string, raw: string): Promise<void> {
+	const contents = `=== Response ===\n${raw}\n`;
+	await writeModelLog(id, contents, true);
 }
 
 /**
@@ -129,51 +164,19 @@ function getConfig() {
 		basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
 		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
-		maxContextTokens: config.get<number>('maxContextTokens', 120000),
+		enableModelLogging: config.get<boolean>('enableModelLogging', false),
 		preferenceLogPath: config.get<string>('preferenceLogPath', ''),
 		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
-		viewportRadius: config.get<number>('viewportRadius', 10),
+		sweepViewportLines: config.get<number>('sweepViewportLines', 21),
+		sweepOpenedFileContext: config.get<string>('sweepOpenedFileContext', 'full'),
+		sweepHistoryCenter: config.get<string>('sweepHistoryCenter', 'changed'),
+		sweepMaxHistoryEntries: config.get<number>('sweepMaxHistoryEntries', 64),
 	};
-}
-
-// -------------------- Context Window Management --------------------
-
-/**
- * Truncate conversation messages to fit within the context window.
- * Assumes system prompt is the first message.
- * Uses drop-half strategy: when over budget, drops the first half of conversation
- * messages to maximize KV cache hits.
- */
-function truncateToContextLimit(
-	messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-	maxTokens: number
-): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
-	if (messages.length === 0) { return messages; }
-
-	const systemTokens = estimateTokens(messages[0].content);
-	const availableTokens = maxTokens - systemTokens;
-
-	const conversationMessages = messages.slice(1);
-	const totalConversationTokens = conversationMessages.reduce(
-		(sum, m) => sum + estimateTokens(m.content), 0
-	);
-
-	if (totalConversationTokens <= availableTokens) {
-		return messages;
-	}
-
-	// Drop first half of conversation messages to maximize KV cache hits
-	const halfIndex = Math.ceil(conversationMessages.length / 2);
-	const keptMessages = conversationMessages.slice(halfIndex);
-	const keptTokens = keptMessages.reduce((sum, m) => sum + estimateTokens(m.content), 0);
-
-	console.log(`[crowd-pilot] Dropped first ${halfIndex} messages (${systemTokens + totalConversationTokens} -> ${systemTokens + keptTokens} tokens)`);
-	return [messages[0], ...keptMessages];
 }
 
 
 // Global conversation state manager instance
-let conversationManager: ConversationStateManager;
+let conversationManager: SweepConversationStateManager;
 
 // Track activated files (files whose content we've captured)
 // TODO (f.srambical): This logic remains on the extension-side
@@ -189,6 +192,7 @@ const activatedFiles = new Set<string>();
 function clearContext(): void {
 	conversationManager.reset();
 	activatedFiles.clear();
+	lastPredictionContext = null;
 	console.log('[crowd-pilot] Context cleared');
 }
 
@@ -213,8 +217,11 @@ export function activate(context: vscode.ExtensionContext) {
 	console.log('[crowd-pilot] Extension activated');
 
 	const cfg = getConfig();
-	conversationManager = new ConversationStateManager({
-		viewportRadius: cfg.viewportRadius,
+	conversationManager = new SweepConversationStateManager({
+		viewportLines: cfg.sweepViewportLines,
+		openedFileContext: cfg.sweepOpenedFileContext,
+		historyCenter: cfg.sweepHistoryCenter,
+		maxHistoryEntries: cfg.sweepMaxHistoryEntries,
 	});
 
 	previewManager = new PreviewManager();
@@ -518,11 +525,17 @@ const PREDICTION_DEBOUNCE_MS = 150;
 const PREDICTION_THROTTLE_MS = 300;
 
 type PendingPrediction = { id: number; timer: NodeJS.Timeout };
+type PredictionContext = {
+	docUri: string;
+	docVersion: number;
+	actionLineRange: { start: number; end: number } | null;
+};
 
 let nextQueuedPredictionId = 0;
 let pendingPredictions: PendingPrediction[] = [];
 const cancelledPredictionIds = new Set<number>();
 let lastPredictionTimestamp: number | undefined;
+let lastPredictionContext: PredictionContext | null = null;
 
 /**
  * Show preview UI for the given action using the PreviewManager.
@@ -546,6 +559,113 @@ function hidePreviewUI(suppress?: boolean): void {
 	}
 }
 
+function canRequestPrediction(editor: vscode.TextEditor, userRequested: boolean): boolean {
+	if (!userRequested && suppressAutoPreview) {
+		return false;
+	}
+	if (!userRequested) {
+		if (!vscode.window.state.focused) {
+			return false;
+		}
+		if (editor.document.getText().length === 0) {
+			return false;
+		}
+		if (editor.selections.some(selection => !selection.isEmpty)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+function actionLineRange(action: Action): { start: number; end: number } | null {
+	if (action.kind === 'editReplace' || action.kind === 'editDelete') {
+		return {
+			start: action.range.start[0],
+			end: action.range.end[0],
+		};
+	}
+	if (action.kind === 'editInsert') {
+		return {
+			start: action.position[0],
+			end: action.position[0],
+		};
+	}
+	if (action.kind === 'setSelections') {
+		const first = action.selections[0];
+		if (!first) {
+			return null;
+		}
+		return {
+			start: first.start[0],
+			end: first.end[0],
+		};
+	}
+	if (action.kind === 'openFile' && action.selections && action.selections.length > 0) {
+		const first = action.selections[0];
+		return {
+			start: first.start[0],
+			end: first.end[0],
+		};
+	}
+	return null;
+}
+
+function shouldReuseCurrentPrediction(editor: vscode.TextEditor): boolean {
+	if (!currentAction || !previewManager.isVisible()) {
+		return false;
+	}
+	if (!lastPredictionContext) {
+		return false;
+	}
+	const doc = editor.document;
+	if (doc.uri.toString() !== lastPredictionContext.docUri) {
+		return false;
+	}
+	if (doc.version !== lastPredictionContext.docVersion) {
+		return false;
+	}
+	if (editor.selections.some(selection => !selection.isEmpty)) {
+		return false;
+	}
+	if (!lastPredictionContext.actionLineRange) {
+		return false;
+	}
+	const cursorLine = editor.selection.active.line;
+	return cursorLine >= lastPredictionContext.actionLineRange.start
+		&& cursorLine <= lastPredictionContext.actionLineRange.end;
+}
+
+function shouldReplaceAction(current: Action, next: Action): boolean {
+	if (current.kind !== next.kind) {
+		return true;
+	}
+	if (current.kind === 'editReplace' && next.kind === 'editReplace') {
+		const sameRange =
+			current.range.start[0] === next.range.start[0] &&
+			current.range.start[1] === next.range.start[1] &&
+			current.range.end[0] === next.range.end[0] &&
+			current.range.end[1] === next.range.end[1];
+		if (!sameRange) {
+			return true;
+		}
+		return !next.text.startsWith(current.text);
+	}
+	if (current.kind === 'setSelections' && next.kind === 'setSelections') {
+		const c = current.selections[0];
+		const n = next.selections[0];
+		if (!c || !n) {
+			return true;
+		}
+		return !(
+			c.start[0] === n.start[0]
+			&& c.start[1] === n.start[1]
+			&& c.end[0] === n.end[0]
+			&& c.end[1] === n.end[1]
+		);
+	}
+	return true;
+}
+
 /**
  * Schedule a model preview refresh, coalescing rapid editor events and
  * throttling how often we actually talk to the model.
@@ -554,25 +674,15 @@ function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): v
 	if (!suggestionsEnabled) {
 		return;
 	}
-	if (!userRequested && suppressAutoPreview) {
-		return;
-	}
 
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) {
 		hidePreviewUI();
 		return;
 	}
-
-	if (!userRequested) {
-		if (!vscode.window.state.focused) {
-			hidePreviewUI();
-			return;
-		}
-		if (editor.document.getText().length === 0) {
-			hidePreviewUI();
-			return;
-		}
+	if (!canRequestPrediction(editor, userRequested)) {
+		hidePreviewUI();
+		return;
 	}
 
 	const now = Date.now();
@@ -616,6 +726,13 @@ async function autoShowNextAction(): Promise<void> {
 	if (suppressAutoPreview) { return; }
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
+	if (!canRequestPrediction(editor, false)) {
+		hidePreviewUI();
+		return;
+	}
+	if (shouldReuseCurrentPrediction(editor)) {
+		return;
+	}
 	try {
 		currentAbortController?.abort();
 		const controller = new AbortController();
@@ -623,7 +740,14 @@ async function autoShowNextAction(): Promise<void> {
 		const requestId = ++latestRequestId;
 		const next = await requestModelActions(editor, controller.signal);
 		if (requestId !== latestRequestId) { return; }
-		if (next) { showPreviewUI(next); } else { hidePreviewUI(); }
+		if (next) {
+			if (currentAction && previewManager.isVisible() && !shouldReplaceAction(currentAction, next)) {
+				return;
+			}
+			showPreviewUI(next);
+		} else {
+			hidePreviewUI();
+		}
 	} catch (err) {
 		const e = err as any;
 		const isAbort = e?.name === 'AbortError' || /aborted/i.test(String(e?.message ?? ''));
@@ -653,6 +777,12 @@ async function callSGLangChat(): Promise<void> {
 	requestBody.chat_template_kwargs = {
 		enable_thinking: false
 	};
+	const requestId = createModelLogId();
+	try {
+		await logModelPrompt(requestId, JSON.stringify(requestBody, null, 2));
+	} catch (err) {
+		console.error('[crowd-pilot] Failed to log model prompt:', err);
+	}
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
@@ -673,11 +803,18 @@ async function callSGLangChat(): Promise<void> {
 					data += chunk.toString();
 				});
 				res.on('end', () => {
-					try {
-						resolve(JSON.parse(data));
-					} catch (err) {
-						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
-					}
+					void (async () => {
+						try {
+							await logModelResponse(requestId, data);
+						} catch (err) {
+							console.error('[crowd-pilot] Failed to log model response:', err);
+						}
+						try {
+							resolve(JSON.parse(data));
+						} catch (err) {
+							reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+						}
+					})();
 				});
 			});
 
@@ -704,21 +841,23 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	};
 
 	const doc = editor.document;
-
-	const systemPrompt = getDefaultSystemPrompt(cfg.viewportRadius);
-
-	const accumulatedMessages = conversationManager.finalizeForModel();
-	
-	let conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-		{ role: 'system', content: systemPrompt },
-	];
-	
-	for (const msg of accumulatedMessages) {
-		const role = msg.role === 'user' ? 'user' : 'assistant';
-		conversationMessages.push({ role, content: msg.content });
+	const promptPayload = conversationManager.finalizeForModel();
+	const conversationMessages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> =
+		promptPayload.messages.map((msg: any) => {
+			const role = msg.role === 'assistant' ? 'assistant' : msg.role === 'user' ? 'user' : 'system';
+			return { role, content: msg.content };
+		});
+	if (conversationMessages.length === 0) {
+		throw new Error('Sweep prompt is empty');
 	}
-
-	conversationMessages = truncateToContextLimit(conversationMessages, cfg.maxContextTokens);
+	const requestContext: SweepRequestContext = {
+		docUri: doc.uri.toString(),
+		docVersion: doc.version,
+		targetFile: String(promptPayload.targetFile ?? doc.uri.fsPath),
+		windowStartLine: Number(promptPayload.windowStartLine ?? 1),
+		windowEndLine: Number(promptPayload.windowEndLine ?? 0),
+		currentWindow: String(promptPayload.currentWindow ?? ''),
+	};
 
 	const requestBody: any = {
 		model: cfg.modelName,
@@ -732,6 +871,12 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	requestBody.chat_template_kwargs = {
 		enable_thinking: false
 	};
+	const requestId = createModelLogId();
+	try {
+		await logModelPrompt(requestId, JSON.stringify(requestBody, null, 2));
+	} catch (err) {
+		console.error('[crowd-pilot] Failed to log model prompt:', err);
+	}
 
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
@@ -752,11 +897,18 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 			let data = '';
 			res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
 			res.on('end', () => {
-				try {
-					resolve(JSON.parse(data));
-				} catch (err) {
-					reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
-				}
+				void (async () => {
+					try {
+						await logModelResponse(requestId, data);
+					} catch (err) {
+						console.error('[crowd-pilot] Failed to log model response:', err);
+					}
+					try {
+						resolve(JSON.parse(data));
+					} catch (err) {
+						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+					}
+				})();
 			});
 		});
 		req.on('error', (err: Error) => reject(err));
@@ -773,11 +925,25 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const action = parseAction(content, doc);
+	const currentDoc = editor.document;
+	if (currentDoc.uri.toString() !== requestContext.docUri) {
+		return undefined as any;
+	}
+	if (currentDoc.version !== requestContext.docVersion
+		&& !isSweepResponseStillApplicable(currentDoc, requestContext)) {
+		return undefined as any;
+	}
+
+	const action = parseSweepAction(content, currentDoc);
 	
 	if (!action) {
 		throw new Error('No valid action parsed from model output');
 	}
+	lastPredictionContext = {
+		docUri: currentDoc.uri.toString(),
+		docVersion: currentDoc.version,
+		actionLineRange: actionLineRange(action),
+	};
 
 	markPendingAsIgnored();
 
@@ -815,248 +981,96 @@ function extractChatContent(json: any): string | undefined {
  * Returns -Infinity if logprobs are not available.
  */
 function calculateAverageLogprob(json: any): number {
-	const logprobs = json.choices[0]?.logprobs;
-	const sum = logprobs.content.reduce((s: number, t: any) => s + t.logprob, 0);
-	return sum / logprobs.content.length;
+	const logprobs = json?.choices?.[0]?.logprobs;
+	const tokens = logprobs?.content;
+	if (!Array.isArray(tokens) || tokens.length === 0) {
+		return Number.NEGATIVE_INFINITY;
+	}
+	let sum = 0;
+	let count = 0;
+	for (const token of tokens) {
+		if (typeof token.logprob === 'number') {
+			sum += token.logprob;
+			count += 1;
+		}
+	}
+	if (count === 0) {
+		return Number.NEGATIVE_INFINITY;
+	}
+	return sum / count;
 }
 
-function parseAction(raw: string, doc?: vscode.TextDocument): Action | undefined {
-	const command = extractBashCommand(raw);
-	if (!command) {
-		return undefined;
+type SweepRequestContext = {
+	docUri: string;
+	docVersion: number;
+	targetFile: string;
+	windowStartLine: number;
+	windowEndLine: number;
+	currentWindow: string;
+};
+
+function normalizeWindowText(text: string): string {
+	return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trimEnd();
+}
+
+function getDocumentWindowText(
+	doc: vscode.TextDocument,
+	windowStartLine: number,
+	windowEndLine: number
+): string {
+	if (doc.lineCount <= 0) {
+		return '';
 	}
-	const normalized = command.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+	if (windowEndLine < windowStartLine) {
+		return '';
+	}
+	const start0 = Math.max(0, windowStartLine - 1);
+	const end0 = Math.max(start0, windowEndLine - 1);
+	if (start0 >= doc.lineCount) {
+		return '';
+	}
+	const clampedEnd = Math.min(end0, doc.lineCount - 1);
+	const lines: string[] = [];
+	for (let line = start0; line <= clampedEnd; line += 1) {
+		lines.push(doc.lineAt(line).text);
+	}
+	return lines.join('\n');
+}
+
+function isSweepResponseStillApplicable(
+	doc: vscode.TextDocument,
+	requestContext: SweepRequestContext
+): boolean {
+	if (path.normalize(doc.uri.fsPath) !== path.normalize(requestContext.targetFile)) {
+		return false;
+	}
+	const currentWindow = getDocumentWindowText(
+		doc,
+		requestContext.windowStartLine,
+		requestContext.windowEndLine
+	);
+	return normalizeWindowText(currentWindow) === normalizeWindowText(requestContext.currentWindow);
+}
+
+function parseSweepAction(raw: string, doc: vscode.TextDocument): Action | undefined {
+	const normalized = raw.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
 	if (!normalized) {
 		return undefined;
 	}
-	if (doc) {
-		const editAction = parseEditFromSedCommand(normalized, doc);
-		if (editAction) {
-			return editAction;
-		}
-		const viewportAction = parseViewportFromCatCommand(normalized, doc);
-		if (viewportAction) {
-			return viewportAction;
-		}
-	}
-	// Sanitize terminal commands for cleaner display
-	const sanitizedCommand = sanitizeCommandForDisplay(normalized);
-	return { kind: 'terminalSendText', text: sanitizedCommand };
-}
 
-/**
- * Sanitize a command string for display, removing shell artifacts and escaping.
- */
-function sanitizeCommandForDisplay(cmd: string): string {
-	return cmd
-		.replace(/^-[A-Z]\s*/gm, '')     // Remove stray flag artifacts at line starts
-		.replace(/'\"'\"'/g, "'")         // Fix shell quote escaping
-		.replace(/\\\\/g, '\\')           // Normalize double backslashes
-		.replace(/\\n/g, '\n')            // Convert escaped newlines
-		.replace(/\\t/g, '\t')            // Convert escaped tabs
-		.trim();
-}
-
-/**
- * Parse a sed-based edit command of the form emitted by the NeMo serializer into a VS Code edit action.
- *
- * Supported patterns (1-based line numbers, mirroring serialization_utils.py):
- *   sed -i 'START,ENDc\n<replacement...>' <file>     -> editReplace
- *   sed -i 'START,ENDd' <file>                      -> editDelete
- *   sed -i 'STARTi\n<insert...>' <file>             -> editInsert (before START)
- *   sed -i '$a\n<append...>' <file>                 -> editInsert (append at EOF)
- *
- * If the command does not match these patterns, returns undefined.
- */
-function parseEditFromSedCommand(command: string, doc: vscode.TextDocument): Action | undefined {
-	// Only consider the first command before && / ||, since cat -n etc. are for viewport only.
-	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
-	if (!main) {
+	let parsed: SweepParsedEdit | null = null;
+	try {
+		parsed = conversationManager.parseModelResponse(normalized) as SweepParsedEdit | null;
+	} catch {
 		return undefined;
 	}
-
-	// Match: sed with optional flags like -E, -n, -r, followed by -i, then script and file
-	// Handles: sed -i '...' file, sed -E -i '...' file, sed -i -E '...' file, etc.
-	const sedMatch = main.match(/sed\s+(?:-[A-Za-z]+\s+)*-i\s+(?:-[A-Za-z]+\s+)*'([\s\S]*?)'\s+([^\s&|]+)\s*$/);
-	if (!sedMatch) {
+	if (!parsed) {
 		return undefined;
 	}
-	const script = sedMatch[1] ?? '';
-	const targetFile = sedMatch[2] ?? '';
-	const activePath = doc.uri.fsPath;
-	if (targetFile !== activePath) {
-		return undefined;
-	}
-
-	// Delete: "START,ENDd"
-	const deleteMatch = script.match(/^(\d+),(\d+)d$/);
-	if (deleteMatch) {
-		const startLine1 = Number(deleteMatch[1]);
-		const endLine1 = Number(deleteMatch[2]);
-		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
-			return undefined;
-		}
-		const startLine0 = Math.max(0, startLine1 - 1);
-		const endLine0 = Math.max(0, endLine1 - 1);
-
-		let endPosLine = endLine0 + 1;
-		let endPosChar = 0;
-		if (endPosLine >= doc.lineCount) {
-			endPosLine = doc.lineCount - 1;
-			endPosChar = doc.lineAt(endPosLine).range.end.character;
-		}
-		return {
-			kind: 'editDelete',
-			range: {
-				start: [startLine0, 0],
-				end: [endPosLine, endPosChar],
-			},
-		};
-	}
-
-	// Replace: "START,ENDc\newline<payload...>"
-	const replaceMatch = script.match(/^(\d+),(\d+)c\\\n([\s\S]*)$/);
-	if (replaceMatch) {
-		const startLine1 = Number(replaceMatch[1]);
-		const endLine1 = Number(replaceMatch[2]);
-		let payload = replaceMatch[3] ?? '';
-		if (!Number.isFinite(startLine1) || !Number.isFinite(endLine1)) {
-			return undefined;
-		}
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const startLine0 = Math.max(0, startLine1 - 1);
-		const endLine0 = Math.max(0, endLine1 - 1);
-		const startPos: [number, number] = [startLine0, 0];
-
-		let endPosLine = endLine0 + 1;
-		let endPosChar = 0;
-		if (endPosLine >= doc.lineCount) {
-			endPosLine = doc.lineCount - 1;
-			endPosChar = doc.lineAt(endPosLine).range.end.character;
-		}
-
-		const text = payload.endsWith('\n') ? payload : payload + '\n';
-		return {
-			kind: 'editReplace',
-			range: { start: startPos, end: [endPosLine, endPosChar] },
-			text,
-		};
-	}
-
-	const insertMatch = script.match(/^(\d+)i\\\n([\s\S]*)$/);
-	if (insertMatch) {
-		const line1 = Number(insertMatch[1]);
-		let payload = insertMatch[2] ?? '';
-		if (!Number.isFinite(line1)) {
-			return undefined;
-		}
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const insertLine0 = Math.max(0, line1 - 1);
-		const position: [number, number] = [insertLine0, 0];
-		const text = payload.endsWith('\n') ? payload : payload + '\n';
-		return {
-			kind: 'editInsert',
-			position,
-			text,
-		};
-	}
-
-	const appendMatch = script.match(/^\$a\\\n([\s\S]*)$/);
-	if (appendMatch) {
-		let payload = appendMatch[1] ?? '';
-		payload = payload.replace(/'\"'\"'/g, "'");
-		// Convert escape sequences to actual characters
-		payload = payload.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
-		const insertLine0 = doc.lineCount;
-		const position: [number, number] = [insertLine0, 0];
-		const needsLeadingNewline = doc.lineCount > 0;
-		const base = payload.endsWith('\n') ? payload : payload + '\n';
-		const text = needsLeadingNewline ? '\n' + base : base;
-		return {
-			kind: 'editInsert',
-			position,
-			text,
-		};
-	}
-
-	return undefined;
-}
-
-/**
- * Parse viewport / selection commands of the form:
- *   cat -n <file> | sed -n 'START,ENDp'
- *
- * into a lightweight VS Code selection move (setSelections). This mirrors how
- * selection and viewport events are serialized in serialization_utils.py.
- */
-function parseViewportFromCatCommand(command: string, doc: vscode.TextDocument): Action | undefined {
-	const main = command.split(/&&|\|\|/)[0]?.trim() ?? '';
-	if (!main) {
-		return undefined;
-	}
-
-	// Simple file-open: cat -n <file>
-	const simpleCatMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*$/);
-	if (simpleCatMatch) {
-		const targetFile = simpleCatMatch[1] ?? '';
-		if (targetFile !== doc.uri.fsPath) {
-			return { kind: 'openFile', filePath: targetFile };
-		}
-		// Ensure the active document is visible; rely on existing editor to handle this.
-		return { kind: 'showTextDocument' };
-	}
-
-	// Viewport slice: cat -n <file> | sed -n 'START,ENDp'
-	const viewportMatch = main.match(/^cat\s+-n\s+([^\s|]+)\s*\|\s*sed\s+-n\s+'(\d+),(\d+)p'\s*$/);
-	if (!viewportMatch) {
-		return undefined;
-	}
-
-	const targetFile = viewportMatch[1] ?? '';
-	const startStr = viewportMatch[2] ?? '';
-	const endStr = viewportMatch[3] ?? '';
-
-	const startLine1 = Number(startStr);
-	const endLine1 = Number(endStr);
-
-	// Place the cursor in the middle of the viewport (1-based to 0-based).
-	const center1 = Math.floor((startLine1 + endLine1) / 2);
-	const center0 = Math.max(0, center1 - 1);
-
-	if (targetFile !== doc.uri.fsPath) {
-		return {
-			kind: 'openFile',
-			filePath: targetFile,
-			selections: [{ start: [center0, 0], end: [center0, 0] }]
-		};
-	}
-	const lastLine = Math.max(0, doc.lineCount - 1);
-	const line = Math.min(center0, lastLine);
-
-	return {
-		kind: 'setSelections',
-		selections: [
-			{
-				start: [line, 0],
-				end: [line, 0],
-			},
-		],
+	const snapshot = {
+		activeFilePath: doc.uri.fsPath,
+		lineCount: doc.lineCount,
+		lastLineLength: doc.lineCount > 0 ? doc.lineAt(doc.lineCount - 1).range.end.character : 0,
 	};
-}
-
-function extractBashCommand(raw: string): string | undefined {
-	if (!raw) {
-		return undefined;
-	}
-	const trimmed = raw.trim();
-	const fenceMatch = trimmed.match(/```(?:bash)?\s*([\s\S]*?)```/i);
-	if (fenceMatch && fenceMatch[1]) {
-		return fenceMatch[1];
-	}
-	// Fallback: treat entire response as the command
-	return trimmed.length > 0 ? trimmed : undefined;
+	return parsedSweepEditToAction(parsed, snapshot) as Action | undefined;
 }
