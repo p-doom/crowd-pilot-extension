@@ -5,6 +5,7 @@ import { CrowdPilotInlineProvider } from './inlineProvider';
 import { MetaActionHoverProvider } from './hoverProvider';
 import { showPendingActionQuickPick, QuickPickResult } from './quickPick';
 import { computeDeletionRanges, hasInsertions, analyzeCoherentReplacement, analyzePureInsertion } from '../utils/diff';
+import { computeMinimalChangeRange } from '../utils/parsing';
 
 // Re-export types
 export { Action, toVscodeRange, toVscodePosition, truncate } from './types';
@@ -183,11 +184,10 @@ export class PreviewManager {
     }
 
     /**
-     * Show preview for text replacement using decorations.
-     * Case 1: Pure insertion (no deletions) → show only inserted text inline in green
-     * Case 2: Has deletions → decorations (red deletion + green addition)
-     *         - If coherent (single substring replacement): show green inline after red
-     *         - If not coherent (scattered changes): show green block on next line
+     * Show preview for text replacement.
+     * Uses VS Code's inline completion API (ghost text) for proper multi-line display.
+     * Case 1: Pure insertion (no deletions) → show as ghost text
+     * Case 2: Has deletions → red strikethrough decoration + ghost text for new content
      */
     private showReplacePreview(action: { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }, editor?: vscode.TextEditor): void {
         if (!editor) {
@@ -200,10 +200,13 @@ export class PreviewManager {
         // Case 1: Check for pure insertion first (no deletions)
         const pureInsertion = analyzePureInsertion(editor.document, range, action.text);
         if (pureInsertion.isPureInsertion && pureInsertion.insertionPosition && pureInsertion.insertionText) {
-            // Pure insertion: show only the new text inline in green (no red)
-            this.showInlineInsertion(editor, pureInsertion.insertionPosition, pureInsertion.insertionText);
+            // Pure insertion: show the new text as ghost text (multi-line capable)
+            this.inlineProvider.setInlineReplace({
+                position: pureInsertion.insertionPosition,
+                text: pureInsertion.insertionText
+            });
         } else {
-            // Case 2: Has deletions - show red strikethrough
+            // Case 2: Has deletions - show red strikethrough decoration
             const deletionRanges = computeDeletionRanges(editor.document, range, action.text);
             
             if (deletionRanges.length > 0) {
@@ -216,18 +219,32 @@ export class PreviewManager {
                 this.decorationPool.setDecorations(editor, 'deletion', [{ range }]);
             }
             
-            // Green highlight on text being added - only if there's actual new content
-            // Don't show if it's purely a deletion (new text is subset of old text)
+            // Show new text as ghost text - only if there's actual new content
             if (hasInsertions(oldText, action.text)) {
-                // Check if this is a coherent single-substring replacement
+                // Find where to show the ghost text
                 const coherent = analyzeCoherentReplacement(editor.document, range, action.text);
                 
                 if (coherent.isCoherent && coherent.deletionRange && coherent.insertionText) {
-                    // Coherent: show green text inline right after the red deletion
-                    this.showInlineInsertion(editor, coherent.deletionRange.end, coherent.insertionText);
+                    // Coherent: show ghost text right after the deleted portion
+                    this.inlineProvider.setInlineReplace({
+                        position: coherent.deletionRange.end,
+                        text: coherent.insertionText
+                    });
                 } else {
-                    // Not coherent: show green block on next line
-                    this.showInsertionBlock(editor, range.end.line, action.text);
+                    // Not coherent: compute minimal change to show only the actual additions
+                    // This avoids showing the entire replacement text (which would look like duplication)
+                    const minimalChange = computeMinimalChangeRange(oldText, action.text);
+                    
+                    if (minimalChange) {
+                        // Position ghost text at where the change starts in the document
+                        const changeStartLine = range.start.line + minimalChange.oldStart;
+                        const changeStartPos = new vscode.Position(changeStartLine, 0);
+                        
+                        this.inlineProvider.setInlineReplace({
+                            position: changeStartPos,
+                            text: minimalChange.newText
+                        });
+                    }
                 }
             }
         }
@@ -238,57 +255,42 @@ export class PreviewManager {
 
     /**
      * Show inserted text inline at a specific position (right after deleted text).
-     * Used for coherent single-substring replacements.
+     * Uses VS Code's inline completion API for proper multi-line display.
      */
     private showInlineInsertion(editor: vscode.TextEditor, position: vscode.Position, text: string): void {
-        // Format text for display
-        const displayText = text.replace(/\n/g, '↵').replace(/\t/g, '→');
-        const truncatedText = truncate(displayText, 60);
+        // Don't show empty previews
+        if (!text.trim()) {
+            return;
+        }
         
-        const decorationOptions: vscode.DecorationOptions[] = [{
-            range: new vscode.Range(position, position),
-            renderOptions: {
-                after: {
-                    contentText: truncatedText,
-                    color: COLORS.insertion.foreground,
-                    backgroundColor: COLORS.insertion.background,
-                    fontStyle: 'normal',
-                    border: '1px solid',
-                    borderColor: COLORS.insertion.border,
-                }
-            }
-        }];
-
-        this.decorationPool.setDecorations(editor, 'insertion-inline', decorationOptions);
+        // Use inline completion (ghost text) for multi-line support
+        // This shows the actual code formatting instead of ↵ characters
+        this.inlineProvider.setInlineReplace({
+            position,
+            text
+        });
     }
 
     /**
      * Show the new/inserted text with green highlight as a block after the specified line.
+     * Uses VS Code's inline completion API for proper multi-line display.
      */
     private showInsertionBlock(editor: vscode.TextEditor, afterLine: number, text: string): void {
+        // Don't show empty previews
+        if (!text.trim()) {
+            return;
+        }
+        
+        // Find anchor position - end of the specified line
         const anchorLine = Math.min(afterLine, editor.document.lineCount - 1);
-        const anchorPos = new vscode.Position(anchorLine, Number.MAX_SAFE_INTEGER);
+        const lineLength = editor.document.lineAt(anchorLine).text.length;
+        const position = new vscode.Position(anchorLine, lineLength);
         
-        // Format text for display (escape for CSS content)
-        const displayText = text.replace(/\n/g, '↵').replace(/\t/g, '→');
-        const truncatedText = truncate(displayText, 80);
-        
-        const decorationOptions: vscode.DecorationOptions[] = [{
-            range: new vscode.Range(anchorPos, anchorPos),
-            renderOptions: {
-                after: {
-                    contentText: `  + ${truncatedText}`,
-                    color: COLORS.insertion.foreground,
-                    backgroundColor: COLORS.insertion.background,
-                    fontStyle: 'normal',
-                    margin: '0 0 0 2ch',
-                    border: '1px solid',
-                    borderColor: COLORS.insertion.border,
-                }
-            }
-        }];
-
-        this.decorationPool.setDecorations(editor, 'insertion-block', decorationOptions);
+        // Use inline completion (ghost text) for multi-line support
+        this.inlineProvider.setInlineReplace({
+            position,
+            text
+        });
     }
 
     /**
@@ -319,7 +321,7 @@ export class PreviewManager {
         const anchorLine = this.getVisibleAnchorLine(editor);
         const cmdPreview = truncate(action.text, 60);
         
-        this.showMetaIndicator(editor, anchorLine, '$(terminal)', `Run: ${cmdPreview}`, COLORS.terminal);
+        this.showMetaIndicator(editor, anchorLine, '▶', `Run: ${cmdPreview}`, COLORS.terminal);
         this.hoverProvider.setAction(action, anchorLine);
     }
 
@@ -342,13 +344,12 @@ export class PreviewManager {
         if (isTargetVisible) {
             // Target is visible, show indicator at target
             anchorLine = targetLine;
-            icon = '$(arrow-right)';
+            icon = '→';
             label = 'Move cursor here';
         } else {
             // Target is off-screen, show indicator at edge of visible area
             anchorLine = this.getVisibleAnchorLine(editor);
-            const direction = targetLine < anchorLine ? '↑' : '↓';
-            icon = `$(arrow-${targetLine < anchorLine ? 'up' : 'down'})`;
+            icon = targetLine < anchorLine ? '↑' : '↓';
             label = `Go to line ${targetLine + 1}`;
         }
 
@@ -372,7 +373,7 @@ export class PreviewManager {
             ? `Open: ${fileName}:${targetLine + 1}`
             : `Open: ${fileName}`;
 
-        this.showMetaIndicator(editor, anchorLine, '$(file)', label, COLORS.fileSwitch);
+        this.showMetaIndicator(editor, anchorLine, '📄', label, COLORS.fileSwitch);
         this.hoverProvider.setAction(action, anchorLine);
     }
 

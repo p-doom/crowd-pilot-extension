@@ -1,19 +1,43 @@
 import * as vscode from 'vscode';
-import { Action, toVscodePosition } from './types';
+import { Action, toVscodePosition, toVscodeRange } from './types';
+
+/**
+ * Data needed to show inline ghost text for replacements.
+ */
+export interface InlineReplaceData {
+    /** Position where ghost text should appear (end of deletion range) */
+    position: vscode.Position;
+    /** The new text to show as ghost text */
+    text: string;
+}
 
 /**
  * Provides inline completion items (ghost text) for code edit actions.
  * This takes priority over Cursor's hints and works on empty lines.
+ * Supports multi-line ghost text display.
  */
 export class CrowdPilotInlineProvider implements vscode.InlineCompletionItemProvider {
     private action: Action | null = null;
+    private inlineReplaceData: InlineReplaceData | null = null;
     private enabled: boolean = true;
 
     /**
-     * Set the current action to display as inline completion.
+     * Set the current action to display as inline completion (for editInsert).
      */
     setAction(action: Action): void {
         this.action = action;
+        this.inlineReplaceData = null;
+        // Trigger VS Code to re-query inline completions
+        vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+    }
+
+    /**
+     * Set inline replacement data for editReplace actions.
+     * This shows the new text as multi-line ghost text.
+     */
+    setInlineReplace(data: InlineReplaceData): void {
+        this.inlineReplaceData = data;
+        this.action = null;
         // Trigger VS Code to re-query inline completions
         vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
     }
@@ -23,6 +47,7 @@ export class CrowdPilotInlineProvider implements vscode.InlineCompletionItemProv
      */
     clearAction(): void {
         this.action = null;
+        this.inlineReplaceData = null;
     }
 
     /**
@@ -48,20 +73,31 @@ export class CrowdPilotInlineProvider implements vscode.InlineCompletionItemProv
         context: vscode.InlineCompletionContext,
         token: vscode.CancellationToken
     ): vscode.ProviderResult<vscode.InlineCompletionList | vscode.InlineCompletionItem[]> {
-        if (!this.enabled || !this.action) {
+        if (!this.enabled) {
             return [];
         }
 
-        // Only handle pure insertions (not replacements)
-        // Replacements are handled by decorations to properly show what's being deleted
-        if (this.action.kind !== 'editInsert') {
+        // Handle inline replace data (for editReplace with multi-line new text)
+        if (this.inlineReplaceData) {
+            const { position: insertPos, text } = this.inlineReplaceData;
+            
+            // Show ghost text at the specified position
+            const item = new vscode.InlineCompletionItem(
+                text,
+                new vscode.Range(insertPos, insertPos)
+            );
+            
+            return [item];
+        }
+
+        // Handle editInsert actions
+        if (!this.action || this.action.kind !== 'editInsert') {
             return [];
         }
 
         const insertPos = toVscodePosition(this.action.position);
         
         // Only provide completion if insert position is at or after the cursor
-        // VS Code's inline completion API shows ghost text at/after cursor position
         if (insertPos.isBefore(position)) {
             return [];
         }

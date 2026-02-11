@@ -123,19 +123,21 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
+    "test:unit": "npm run compile && mocha --ui tdd out/test/parsing.test.js",
     "clean": "rm -rf out *.tgz",
     "clean:all": "rm -rf out *.tgz node_modules package-lock.json",
     "rebuild-serializer": "cd crowd-pilot-serializer/crates/napi && npm install && rm -f index.d.ts index.js && npm run build && npm pack && mv *.tgz ../../../ && cd ../../.. && rm -rf node_modules/@crowd-pilot && npm install"
   },
   "devDependencies": {
-    "@types/vscode": "^1.99.3",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
+    "@types/vscode": "^1.99.3",
     "@typescript-eslint/eslint-plugin": "^8.45.0",
     "@typescript-eslint/parser": "^8.45.0",
-    "eslint": "^9.36.0",
-    "typescript": "^5.9.3",
     "@vscode/test-cli": "^0.0.11",
-    "@vscode/test-electron": "^2.5.2"
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.36.0",
+    "mocha": "^10.8.2",
+    "typescript": "^5.9.3"
   }
 }

@@ -4,6 +4,14 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Buffer } from 'buffer';
 import { PreviewManager, Action } from './preview';
+import { logToOutput } from './utils/utilities';
+import {
+	LineRange,
+	MinimalChangeRange,
+	extractLastCodeBlock,
+	computeChangedLineRange,
+	computeMinimalChangeRange,
+} from './utils/parsing';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -37,6 +45,37 @@ function getPreferenceLogPath(): string {
 		return path.join(workspaceFolders[0].uri.fsPath, '.crowd-pilot-preferences.jsonl');
 	}
 	throw new Error("No preference log path found.");
+}
+
+function getPreferenceLogDir(): string {
+	return path.dirname(getPreferenceLogPath());
+}
+
+function createModelLogId(): string {
+	return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function writeModelLog(id: string, contents: string, append: boolean): Promise<void> {
+	const baseDir = getPreferenceLogDir();
+	const dir = path.join(baseDir, 'model-logs');
+	await fs.promises.mkdir(dir, { recursive: true });
+	const filePath = path.join(dir, `${id}.txt`);
+	if (append) {
+		await fs.promises.appendFile(filePath, contents, 'utf8');
+	} else {
+		await fs.promises.writeFile(filePath, contents, 'utf8');
+	}
+}
+
+async function logModelPrompt(id: string, prompt: string): Promise<void> {
+	logToOutput(`[crowd-pilot] Model prompt (${id}):\n${prompt}`);
+	const contents = `=== Prompt ===\n${prompt}\n\n`;
+	await writeModelLog(id, contents, false);
+}
+
+async function logModelResponse(id: string, raw: string): Promise<void> {
+	const contents = `=== Response ===\n${raw}\n`;
+	await writeModelLog(id, contents, true);
 }
 
 /**
@@ -131,7 +170,6 @@ function getConfig() {
 	};
 }
 
-type LineRange = { start: number; end: number };
 type EditHistoryEvent = { oldPath: string; path: string; diff: string };
 type LastEditEvent = {
 	oldText: string;
@@ -686,32 +724,6 @@ function rangesAreNearby(a: LineRange, b: LineRange, span: number): boolean {
 	return (b.start - a.end) <= span;
 }
 
-function computeChangedLineRange(oldText: string, newText: string): LineRange | undefined {
-	const oldLines = oldText.split(/\r?\n/);
-	const newLines = newText.split(/\r?\n/);
-	let prefix = 0;
-	while (
-		prefix < oldLines.length &&
-		prefix < newLines.length &&
-		oldLines[prefix] === newLines[prefix]
-	) {
-		prefix += 1;
-	}
-	let suffix = 0;
-	while (
-		suffix < oldLines.length - prefix &&
-		suffix < newLines.length - prefix &&
-		oldLines[oldLines.length - 1 - suffix] === newLines[newLines.length - 1 - suffix]
-	) {
-		suffix += 1;
-	}
-	if (prefix === oldLines.length && prefix === newLines.length) {
-		return undefined;
-	}
-	const endLine = Math.max(prefix, newLines.length - suffix - 1);
-	return { start: prefix, end: Math.max(prefix, endLine) };
-}
-
 function buildUnifiedDiff(oldText: string, newText: string, contextLines: number): string {
 	const oldLines = oldText.split(/\r?\n/);
 	const newLines = newText.split(/\r?\n/);
@@ -847,6 +859,12 @@ async function callSGLangChat(): Promise<void> {
 	requestBody.chat_template_kwargs = {
 		enable_thinking: false
 	};
+	const requestId = createModelLogId();
+	try {
+		await logModelPrompt(requestId, JSON.stringify(requestBody, null, 2));
+	} catch (err) {
+		console.error('[crowd-pilot] Failed to log model prompt:', err);
+	}
 	const postData = JSON.stringify(requestBody);
 	headers['Content-Length'] = Buffer.byteLength(postData);
 
@@ -866,14 +884,21 @@ async function callSGLangChat(): Promise<void> {
 				res.on('data', (chunk: Buffer) => {
 					data += chunk.toString();
 				});
-				res.on('end', () => {
+			res.on('end', () => {
+				void (async () => {
+					try {
+						await logModelResponse(requestId, data);
+					} catch (err) {
+						console.error('[crowd-pilot] Failed to log model response:', err);
+					}
 					try {
 						resolve(JSON.parse(data));
 					} catch (err) {
 						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
 					}
-				});
+				})();
 			});
+		});
 
 			req.on('error', (err: Error) => {
 				reject(err);
@@ -901,6 +926,12 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	const conversationMessages = [
 		{ role: 'system', content: promptContext.prompt }
 	];
+	const requestId = createModelLogId();
+	try {
+		await logModelPrompt(requestId, promptContext.prompt);
+	} catch (err) {
+		console.error('[crowd-pilot] Failed to log model prompt:', err);
+	}
 
 	const requestBody: any = {
 		model: cfg.modelName,
@@ -934,11 +965,18 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 			let data = '';
 			res.on('data', (chunk: Buffer) => { data += chunk.toString(); });
 			res.on('end', () => {
-				try {
-					resolve(JSON.parse(data));
-				} catch (err) {
-					reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
-				}
+				void (async () => {
+					try {
+						await logModelResponse(requestId, data);
+					} catch (err) {
+						console.error('[crowd-pilot] Failed to log model response:', err);
+					}
+					try {
+						resolve(JSON.parse(data));
+					} catch (err) {
+						reject(new Error(`Failed to parse response: ${err instanceof Error ? err.message : String(err)}`));
+					}
+				})();
 			});
 		});
 		req.on('error', (err: Error) => reject(err));
@@ -952,15 +990,53 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 	if (typeof content !== 'string' || content.trim().length === 0) {
 		throw new Error('Empty model content');
 	}
-	const action = parseTeacherResponse(content, promptContext);
+
+	// If document changed while waiting, try to rebase the model's prediction.
+	// Only rebase for minor changes (same line count). If the user added/removed lines,
+	// the content has shifted and rebasing would produce incorrect results.
+	let effectiveContext = promptContext;
+	if (editor.document.version !== promptContext.doc.version) {
+		const currentDoc = editor.document;
+		const currentLines = currentDoc.getText().split(/\r?\n/);
+		const originalLines = promptContext.editableText.split(/\r?\n/);
+		
+		// Check if the editable range is still valid
+		const editableEnd = Math.min(promptContext.editableRange.end, currentLines.length - 1);
+		if (editableEnd < promptContext.editableRange.start) {
+			console.log('[crowd-pilot] Discarding response: editable range no longer valid');
+			return undefined;
+		}
+		
+		// Get current text from the same line range
+		const currentEditableText = currentLines.slice(promptContext.editableRange.start, editableEnd + 1).join('\n');
+		const currentEditableLines = currentEditableText.split(/\r?\n/);
+		
+		// Only rebase if the line count is the same (user typed on existing lines, didn't add/remove lines)
+		// If lines were added/removed, the content has shifted and rebasing would be incorrect
+		if (currentEditableLines.length !== originalLines.length) {
+			console.log(`[crowd-pilot] Discarding response: line count changed (${originalLines.length} → ${currentEditableLines.length})`);
+			return undefined;
+		}
+		
+		effectiveContext = {
+			...promptContext,
+			editableText: currentEditableText,
+			editableRange: { start: promptContext.editableRange.start, end: editableEnd },
+			doc: currentDoc,
+			cursor: editor.selection.active,
+		};
+		console.log(`[crowd-pilot] Rebasing response onto current doc (version ${promptContext.doc.version} → ${currentDoc.version})`);
+	}
+
+	const action = parseTeacherResponse(content, effectiveContext);
 	if (!action) {
 		return undefined;
 	}
 	lastPredictionContext = {
-		docUri: promptContext.doc.uri.toString(),
-		docVersion: promptContext.doc.version,
-		editableRange: promptContext.editableRange,
-		cursorLine: promptContext.cursor.line,
+		docUri: effectiveContext.doc.uri.toString(),
+		docVersion: effectiveContext.doc.version,
+		editableRange: effectiveContext.editableRange,
+		cursorLine: effectiveContext.cursor.line,
 	};
 
 	markPendingAsIgnored();
@@ -1188,20 +1264,20 @@ function parseTeacherResponse(raw: string, context: PromptContext): Action | und
 	if (!codeBlock) {
 		return undefined;
 	}
-	const cleaned = stripEditableMarkers(codeBlock);
-	let newEditableText = cleaned.replace(new RegExp(USER_CURSOR_MARKER, "g"), "");
+	const cleaned = codeBlock;
+	let newEditableText = cleaned.replaceAll(USER_CURSOR_MARKER, "");
 	if (context.editableText.endsWith("\n") && !newEditableText.endsWith("\n")) {
 		newEditableText += "\n";
 	}
 	if (context.editableText === newEditableText) {
 		return undefined;
 	}
-	const changeRange = computeChangedLineRange(context.editableText, newEditableText);
+	const changeRange = computeMinimalChangeRange(context.editableText, newEditableText);
 	if (!changeRange) {
 		return undefined;
 	}
-	const absoluteStart = context.editableRange.start + changeRange.start;
-	const absoluteEnd = context.editableRange.start + changeRange.end;
+	const absoluteStart = context.editableRange.start + changeRange.oldStart;
+	const absoluteEnd = context.editableRange.start + changeRange.oldEnd;
 	const cursorLine = context.cursor.line;
 
 	if (cursorLine < absoluteStart - 2 || cursorLine > absoluteEnd + 2) {
@@ -1212,50 +1288,14 @@ function parseTeacherResponse(raw: string, context: PromptContext): Action | und
 		};
 	}
 
-	const endLine = Math.min(context.editableRange.end, context.doc.lineCount - 1);
-	const endChar = context.doc.lineAt(endLine).range.end.character;
+	// Only replace the lines that actually changed, not the entire editable region
+	const replaceStartLine = absoluteStart;
+	const replaceEndLine = Math.min(absoluteEnd, context.doc.lineCount - 1);
+	const endChar = context.doc.lineAt(replaceEndLine).range.end.character;
+	
 	return {
 		kind: "editReplace",
-		range: { start: [context.editableRange.start, 0], end: [endLine, endChar] },
-		text: newEditableText,
+		range: { start: [replaceStartLine, 0], end: [replaceEndLine, endChar] },
+		text: changeRange.newText,
 	};
-}
-
-function stripEditableMarkers(text: string): string {
-	const lines = text.split(/\r?\n/);
-	const filtered = lines.filter((line) => {
-		const trimmed = line.trim();
-		return trimmed !== EDITABLE_REGION_START_LINE && trimmed !== EDITABLE_REGION_END_LINE;
-	});
-	return filtered.join("\n");
-}
-
-function extractLastCodeBlock(text: string): string | undefined {
-	let lastBlock: string | undefined;
-	let searchStart = 0;
-
-	while (true) {
-		const start = text.indexOf("```", searchStart);
-		if (start === -1) {
-			break;
-		}
-		let end = start;
-		while (end < text.length && text[end] === "`") {
-			end += 1;
-		}
-		const fence = text.slice(start, end);
-		const lineBreak = text.indexOf("\n", end);
-		if (lineBreak === -1) {
-			break;
-		}
-		const closing = text.indexOf(`\n${fence}`, lineBreak + 1);
-		if (closing === -1) {
-			searchStart = end;
-			continue;
-		}
-		lastBlock = text.slice(lineBreak + 1, closing + 1);
-		searchStart = closing + fence.length + 1;
-	}
-
-	return lastBlock?.trim();
 }
