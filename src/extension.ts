@@ -537,11 +537,27 @@ const cancelledPredictionIds = new Set<number>();
 let lastPredictionTimestamp: number | undefined;
 let lastPredictionContext: PredictionContext | null = null;
 
+function getPredictionTimingMs(): { debounceMs: number; throttleMs: number } {
+	const config = vscode.workspace.getConfiguration('crowd-pilot');
+	const rawDebounce = config.get<number>('predictionDebounceMs', PREDICTION_DEBOUNCE_MS);
+	const rawThrottle = config.get<number>('predictionThrottleMs', PREDICTION_THROTTLE_MS);
+	const debounceMs = Number.isFinite(rawDebounce) ? Math.max(0, Math.floor(rawDebounce)) : PREDICTION_DEBOUNCE_MS;
+	const throttleMs = Number.isFinite(rawThrottle) ? Math.max(0, Math.floor(rawThrottle)) : PREDICTION_THROTTLE_MS;
+	return { debounceMs, throttleMs };
+}
+
 /**
  * Show preview UI for the given action using the PreviewManager.
  */
 function showPreviewUI(action: Action): void {
 	previewManager.show(action);
+	const isVisible = previewManager.isVisible();
+	if (!isVisible) {
+		currentAction = undefined;
+		vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, false);
+		vscode.commands.executeCommand('setContext', HAS_PENDING_ACTION_KEY, false);
+		return;
+	}
 	currentAction = action;
 	vscode.commands.executeCommand('setContext', UI_CONTEXT_KEY, true);
 	vscode.commands.executeCommand('setContext', HAS_PENDING_ACTION_KEY, true);
@@ -687,15 +703,16 @@ function schedulePredictionRefresh(debounce: boolean, userRequested: boolean): v
 
 	const now = Date.now();
 	const id = ++nextQueuedPredictionId;
+	const timing = getPredictionTimingMs();
 
 	let delay = 0;
 	if (debounce) {
-		delay = Math.max(delay, PREDICTION_DEBOUNCE_MS);
+		delay = Math.max(delay, timing.debounceMs);
 	}
 	if (lastPredictionTimestamp !== null && lastPredictionTimestamp !== undefined) {
 		const elapsed = now - lastPredictionTimestamp;
-		if (elapsed < PREDICTION_THROTTLE_MS) {
-			delay = Math.max(delay, PREDICTION_THROTTLE_MS - elapsed);
+		if (elapsed < timing.throttleMs) {
+			delay = Math.max(delay, timing.throttleMs - elapsed);
 		}
 	}
 

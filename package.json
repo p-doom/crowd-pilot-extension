@@ -119,6 +119,18 @@
           "type": "number",
           "default": 64,
           "description": "Maximum number of historical Sweep diff windows retained in runtime context"
+        },
+        "crowd-pilot.predictionDebounceMs": {
+          "type": "number",
+          "minimum": 0,
+          "default": 150,
+          "description": "Delay in milliseconds after editor activity before requesting a new prediction"
+        },
+        "crowd-pilot.predictionThrottleMs": {
+          "type": "number",
+          "minimum": 0,
+          "default": 300,
+          "description": "Minimum interval in milliseconds between prediction requests"
         }
       }
     },

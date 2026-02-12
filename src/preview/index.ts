@@ -60,39 +60,41 @@ export class PreviewManager {
         this.clear();
         
         this.currentAction = action;
-        this.visible = true;
+        let rendered = false;
 
         // Route to appropriate renderer based on action type
         switch (action.kind) {
             case 'editInsert':
-                this.showInsertPreview(action, editor);
+                rendered = this.showInsertPreview(action, editor);
                 break;
 
             case 'editReplace':
-                this.showReplacePreview(action, editor);
+                rendered = this.showReplacePreview(action, editor);
                 break;
 
             case 'editDelete':
-                this.showDeletePreview(action, editor);
+                rendered = this.showDeletePreview(action, editor);
                 break;
 
             case 'terminalSendText':
-                this.showTerminalCommandPreview(action, editor);
+                rendered = this.showTerminalCommandPreview(action, editor);
                 break;
 
             case 'setSelections':
-                this.showCursorMovePreview(action, editor);
+                rendered = this.showCursorMovePreview(action, editor);
                 break;
 
             case 'openFile':
-                this.showFileSwitchPreview(action, editor);
+                rendered = this.showFileSwitchPreview(action, editor);
                 break;
 
             case 'terminalShow':
             case 'showTextDocument':
                 // These don't need previews
+                rendered = false;
                 break;
         }
+        this.visible = rendered;
     }
 
     /**
@@ -163,37 +165,49 @@ export class PreviewManager {
      * Case 1: Insert at/after cursor → inline completion (ghost text)
      * Case 2: Insert before cursor → decorations
      */
-    private showInsertPreview(action: { kind: 'editInsert'; position: [number, number]; text: string }, editor?: vscode.TextEditor): void {
+    private showInsertPreview(action: { kind: 'editInsert'; position: [number, number]; text: string }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
         
         const insertPos = toVscodePosition(action.position);
         const anchorLine = Math.min(action.position[0], editor.document.lineCount - 1);
+        let rendered = false;
         
         if (this.canUseInlineCompletion(action, editor)) {
             // Case 1: Use inline completion - clean ghost text
             this.inlineProvider.setAction(action);
+            rendered = true;
         } else {
             // Case 2: Use decorations - show green insertion block
-            this.showInsertionBlock(editor, anchorLine, action.text);
+            rendered = this.showInsertionBlock(editor, anchorLine, action.text);
         }
         
         // Set up hover provider for detailed view
-        this.hoverProvider.setAction(action, anchorLine);
+        if (rendered) {
+            this.hoverProvider.setAction(action, anchorLine);
+        }
+        return rendered;
     }
 
     /**
      * Show preview for text replacement.
      * Uses inline ghost text for multi-line insertions/replacements.
      */
-    private showReplacePreview(action: { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }, editor?: vscode.TextEditor): void {
+    private showReplacePreview(action: { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
 
         const range = toVscodeRange(action.range);
         const oldText = editor.document.getText(range);
+        const shouldRenderBlockSuggestion = this.shouldRenderReplaceInsertionAsBlock(
+            editor,
+            range,
+            oldText,
+            action.text
+        );
+        let rendered = false;
         
         // Case 1: Check for pure insertion first (no deletions)
         const pureInsertion = analyzePureInsertion(editor.document, range, action.text);
@@ -202,6 +216,7 @@ export class PreviewManager {
                 position: pureInsertion.insertionPosition,
                 text: pureInsertion.insertionText
             });
+            rendered = true;
         } else {
             // Case 2: Has deletions - show red strikethrough
             const deletionRanges = computeDeletionRanges(editor.document, range, action.text);
@@ -211,59 +226,172 @@ export class PreviewManager {
                     range: r
                 }));
                 this.decorationPool.setDecorations(editor, 'deletion-char', decorationOptions);
+                rendered = true;
             } else if (!range.isEmpty) {
                 // Highlight entire range if no char-level diff but range is not empty
                 this.decorationPool.setDecorations(editor, 'deletion', [{ range }]);
+                rendered = true;
             }
             
             // Green highlight on text being added - only if there's actual new content
             // Don't show if it's purely a deletion (new text is subset of old text)
             if (hasInsertions(oldText, action.text)) {
-                const coherent = analyzeCoherentReplacement(editor.document, range, action.text);
-                
-                if (coherent.isCoherent && coherent.deletionRange && coherent.insertionText) {
-                    this.inlineProvider.setInlineReplace({
-                        position: coherent.deletionRange.end,
-                        text: coherent.insertionText
-                    });
+                if (shouldRenderBlockSuggestion) {
+                    rendered = this.showReplaceSuggestionBlock(
+                        editor,
+                        this.getRangeEndInclusiveLine(range),
+                        action.text
+                    ) || rendered;
                 } else {
-                    // Not coherent: show only the minimal changed replacement chunk.
-                    const minimalChange = computeMinimalChangeRange(oldText, action.text);
-                    if (minimalChange) {
-                        const changeStartLine = range.start.line + minimalChange.oldStart;
-                        const changeStartPos = new vscode.Position(changeStartLine, 0);
+                    const coherent = analyzeCoherentReplacement(editor.document, range, action.text);
+                    
+                    if (coherent.isCoherent && coherent.deletionRange && coherent.insertionText) {
                         this.inlineProvider.setInlineReplace({
-                            position: changeStartPos,
-                            text: minimalChange.newText
+                            position: coherent.deletionRange.end,
+                            text: coherent.insertionText
                         });
+                        rendered = true;
+                    } else {
+                        // Not coherent: show only the minimal changed replacement chunk.
+                        const minimalChange = computeMinimalChangeRange(oldText, action.text);
+                        if (minimalChange) {
+                            const changeStartLine = range.start.line + minimalChange.oldStart;
+                            const changeStartPos = new vscode.Position(changeStartLine, 0);
+                            this.inlineProvider.setInlineReplace({
+                                position: changeStartPos,
+                                text: minimalChange.newText
+                            });
+                            rendered = true;
+                        } else {
+                            rendered = this.showReplaceSuggestionBlock(
+                                editor,
+                                this.getRangeEndInclusiveLine(range),
+                                action.text
+                            ) || rendered;
+                        }
                     }
                 }
             }
         }
 
         // Set hover provider for full details
-        this.hoverProvider.setAction(action, range.start.line);
+        if (rendered) {
+            this.hoverProvider.setAction(action, range.start.line);
+        }
+        return rendered;
+    }
+
+    private shouldRenderReplaceInsertionAsBlock(
+        editor: vscode.TextEditor,
+        range: vscode.Range,
+        oldText: string,
+        newText: string
+    ): boolean {
+        const oldLineCount = this.countLogicalLines(oldText);
+        const newLineCount = this.countLogicalLines(newText);
+        const isMultilineChange = oldLineCount > 1 || newLineCount > 1;
+        if (!isMultilineChange) {
+            return false;
+        }
+
+        const cursorLine = editor.selection.active.line;
+        const endLineInclusive = this.getRangeEndInclusiveLine(range);
+        return cursorLine >= range.start.line && cursorLine <= endLineInclusive;
+    }
+
+    private countLogicalLines(text: string): number {
+        const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const withoutTrailingNewline = normalized.endsWith('\n')
+            ? normalized.slice(0, -1)
+            : normalized;
+        if (withoutTrailingNewline.length === 0) {
+            return 0;
+        }
+        return withoutTrailingNewline.split('\n').length;
+    }
+
+    private getRangeEndInclusiveLine(range: vscode.Range): number {
+        if (range.end.character === 0 && range.end.line > range.start.line) {
+            return range.end.line - 1;
+        }
+        return range.end.line;
+    }
+
+    private showReplaceSuggestionBlock(
+        editor: vscode.TextEditor,
+        afterLine: number,
+        text: string
+    ): boolean {
+        const blockText = this.normalizeBlockSuggestionText(text);
+        if (!blockText) {
+            return false;
+        }
+
+        const maxLine = Math.max(0, editor.document.lineCount - 1);
+        const anchorLine = Math.min(Math.max(afterLine, 0), maxLine);
+        const anchorPosition = editor.document.lineCount > 0
+            ? new vscode.Position(anchorLine, editor.document.lineAt(anchorLine).text.length)
+            : new vscode.Position(0, 0);
+        const anchorRange = new vscode.Range(anchorPosition, anchorPosition);
+
+        const options: vscode.DecorationOptions[] = [{
+            range: anchorRange,
+            renderOptions: {
+                after: {
+                    contentText: `\n${blockText}`,
+                    color: COLORS.insertion.foreground,
+                    backgroundColor: COLORS.insertion.background,
+                    borderColor: COLORS.insertion.border,
+                    border: '1px solid',
+                    textDecoration: 'none; white-space: pre;',
+                    margin: '0 0 0 0.75ch',
+                }
+            }
+        }];
+        this.decorationPool.setDecorations(editor, 'insertion-block', options);
+        return true;
+    }
+
+    private normalizeBlockSuggestionText(text: string): string {
+        const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+        const withoutTrailingNewline = normalized.endsWith('\n')
+            ? normalized.slice(0, -1)
+            : normalized;
+        if (!withoutTrailingNewline.trim()) {
+            return '';
+        }
+
+        const lines = withoutTrailingNewline.split('\n');
+        const maxLines = 14;
+        if (lines.length <= maxLines) {
+            return lines.join('\n');
+        }
+
+        const truncated = lines.slice(0, maxLines);
+        truncated.push('...');
+        return truncated.join('\n');
     }
 
     /**
      * Show inserted text inline at a specific position (right after deleted text).
      */
-    private showInlineInsertion(editor: vscode.TextEditor, position: vscode.Position, text: string): void {
+    private showInlineInsertion(editor: vscode.TextEditor, position: vscode.Position, text: string): boolean {
         if (!text.trim()) {
-            return;
+            return false;
         }
         this.inlineProvider.setInlineReplace({
             position,
             text
         });
+        return true;
     }
 
     /**
      * Show the new/inserted text with green highlight as a block after the specified line.
      */
-    private showInsertionBlock(editor: vscode.TextEditor, afterLine: number, text: string): void {
+    private showInsertionBlock(editor: vscode.TextEditor, afterLine: number, text: string): boolean {
         if (!text.trim()) {
-            return;
+            return false;
         }
         const anchorLine = Math.min(afterLine, editor.document.lineCount - 1);
         const lineLength = editor.document.lineAt(anchorLine).text.length;
@@ -272,31 +400,36 @@ export class PreviewManager {
             position,
             text
         });
+        return true;
     }
 
     /**
      * Show preview for text deletion with strikethrough decoration.
      */
-    private showDeletePreview(action: { kind: 'editDelete'; range: { start: [number, number]; end: [number, number] } }, editor?: vscode.TextEditor): void {
+    private showDeletePreview(action: { kind: 'editDelete'; range: { start: [number, number]; end: [number, number] } }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
 
         const range = toVscodeRange(action.range);
+        if (range.isEmpty) {
+            return false;
+        }
         
         // Highlight the deletion range
         this.decorationPool.setDecorations(editor, 'deletion', [{ range }]);
 
         // Set hover provider
         this.hoverProvider.setAction(action, range.start.line);
+        return true;
     }
 
     /**
      * Show preview for terminal command with indicator decoration.
      */
-    private showTerminalCommandPreview(action: { kind: 'terminalSendText'; text: string }, editor?: vscode.TextEditor): void {
+    private showTerminalCommandPreview(action: { kind: 'terminalSendText'; text: string }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
 
         const anchorLine = this.getVisibleAnchorLine(editor);
@@ -304,14 +437,15 @@ export class PreviewManager {
         
         this.showMetaIndicator(editor, anchorLine, '$(terminal)', `Run: ${cmdPreview}`, COLORS.terminal);
         this.hoverProvider.setAction(action, anchorLine);
+        return true;
     }
 
     /**
      * Show preview for cursor movement with indicator decoration.
      */
-    private showCursorMovePreview(action: { kind: 'setSelections'; selections: Array<{ start: [number, number]; end: [number, number] }> }, editor?: vscode.TextEditor): void {
+    private showCursorMovePreview(action: { kind: 'setSelections'; selections: Array<{ start: [number, number]; end: [number, number] }> }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
 
         const targetLine = action.selections[0].start[0];
@@ -337,14 +471,15 @@ export class PreviewManager {
 
         this.showMetaIndicator(editor, anchorLine, icon, label, COLORS.cursorMove);
         this.hoverProvider.setAction(action, anchorLine);
+        return true;
     }
 
     /**
      * Show preview for file switch with indicator decoration.
      */
-    private showFileSwitchPreview(action: { kind: 'openFile'; filePath: string; selections?: Array<{ start: [number, number]; end: [number, number] }> }, editor?: vscode.TextEditor): void {
+    private showFileSwitchPreview(action: { kind: 'openFile'; filePath: string; selections?: Array<{ start: [number, number]; end: [number, number] }> }, editor?: vscode.TextEditor): boolean {
         if (!editor) {
-            return;
+            return false;
         }
 
         const anchorLine = this.getVisibleAnchorLine(editor);
@@ -357,6 +492,7 @@ export class PreviewManager {
 
         this.showMetaIndicator(editor, anchorLine, '$(file)', label, COLORS.fileSwitch);
         this.hoverProvider.setAction(action, anchorLine);
+        return true;
     }
 
     // -------------------- Helper Methods --------------------
