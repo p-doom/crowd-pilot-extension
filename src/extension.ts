@@ -9,16 +9,56 @@ import { parsedSweepEditToAction, SweepParsedEdit } from './utils/sweepAction';
 
 // -------------------- Preference Data Collection --------------------
 
+type PreferenceOutcome = 'accepted' | 'rejected' | 'ignored';
+type PreferenceOutcomeSource =
+	| 'tab_accept'
+	| 'quickpick_accept'
+	| 'escape_dismiss'
+	| 'quickpick_dismiss'
+	| 'auto_ignored';
+
+interface PreferencePrompt {
+	model: string;
+	messages: Array<{ role: string; content: string }>;
+	temperature: number;
+	top_p: number;
+	top_k: number;
+	min_p: number;
+	logprobs: boolean;
+	chat_template_kwargs: {
+		enable_thinking: boolean;
+	};
+}
+
+interface PreferenceFileSelection {
+	start: [number, number];
+	end: [number, number];
+}
+
+interface PreferenceFileState {
+	uri: string;
+	fsPath: string;
+	languageId: string;
+	version: number;
+	text: string;
+	selections: PreferenceFileSelection[];
+}
+
 interface PreferenceSample {
+	type: 'preference_sample';
+	sampleId: string;
 	timestamp: number;
+	prompt: PreferencePrompt;
 	context: Array<{ role: string; content: string }>;
+	fileState: PreferenceFileState;
 	completion: {
 		rawModelOutput: string;
 		parsedAction: Action | null;
 		avgLogprob: number;
 	};
-	outcome: 'accepted' | 'rejected' | 'ignored' | null;
+	outcome: PreferenceOutcome | null;
 	outcomeTimestamp: number | null;
+	outcomeSource: PreferenceOutcomeSource | null;
 	modelName: string;
 }
 
@@ -27,7 +67,64 @@ interface PendingPreferenceSample {
 	shownAt: number;
 }
 
+type RejectFollowupStopReason = 'pause' | 'another_action';
+type RejectFollowupAnotherActionType = 'cursor_move' | 'file_switch' | 'terminal_focus' | 'terminal_command';
+
+interface RejectFollowupChange {
+	rangeOffset: number;
+	rangeLength: number;
+	text: string;
+}
+
+interface RejectFollowupEditEvent {
+	ts: number;
+	docVersion: number;
+	contentChanges: RejectFollowupChange[];
+}
+
+interface RejectFollowupSample {
+	type: 'reject_followup';
+	sampleId: string;
+	rejectedAt: number;
+	firstEditAt: number;
+	endedAt: number;
+	stopReason: RejectFollowupStopReason;
+	anotherActionType: RejectFollowupAnotherActionType | null;
+	docUri: string;
+	edits: RejectFollowupEditEvent[];
+	stats: {
+		editEventCount: number;
+		contentChangeCount: number;
+		charsInserted: number;
+		charsDeleted: number;
+	};
+}
+
+type ArmedRejectCaptureState = {
+	phase: 'armed';
+	sampleId: string;
+	rejectedAt: number;
+	originDocUri: string | null;
+	cursorMoveTimer: NodeJS.Timeout | null;
+};
+
+type ActiveRejectCaptureState = {
+	phase: 'active';
+	sampleId: string;
+	rejectedAt: number;
+	docUri: string;
+	firstEditAt: number;
+	edits: RejectFollowupEditEvent[];
+	inactivityTimer: NodeJS.Timeout | null;
+	pendingSelectionSkipVersion: number | null;
+	cursorMoveTimer: NodeJS.Timeout | null;
+};
+
+type RejectCaptureState = ArmedRejectCaptureState | ActiveRejectCaptureState;
+
 let pendingPreferenceSample: PendingPreferenceSample | null = null;
+let rejectCaptureState: RejectCaptureState | null = null;
+const REJECT_CAPTURE_CURSOR_GRACE_MS = 75;
 
 function getPreferenceLogPath(): string {
 	const cfg = getConfig();
@@ -75,27 +172,49 @@ async function logModelResponse(id: string, raw: string): Promise<void> {
 	await writeModelLog(id, contents, true);
 }
 
+function appendPreferenceLogRecord(record: unknown, successMessage: string): void {
+	const cfg = getConfig();
+	if (!cfg.enablePreferenceLogging) {
+		console.log('[crowd-pilot] Preference logging disabled, skipping record');
+		return;
+	}
+
+	const logPath = getPreferenceLogPath();
+	const line = JSON.stringify(record) + '\n';
+	fs.appendFile(logPath, line, (err) => {
+		if (err) {
+			console.error('[crowd-pilot] Failed to append preference record:', err);
+		} else {
+			console.log(successMessage);
+		}
+	});
+}
+
 /**
  * Log a preference sample to the JSONL file.
  * Each line is a complete JSON object for easy streaming/parsing.
  */
 function logPreferenceSample(sample: PreferenceSample): void {
-	const cfg = getConfig();
-	if (!cfg.enablePreferenceLogging) {
-		console.log(`[crowd-pilot] Preference logging disabled, skipping sample`);
-		return;
-	}
+	appendPreferenceLogRecord(sample, `[crowd-pilot] Logged preference sample, outcome: (${sample.outcome})`);
+}
 
-	const logPath = getPreferenceLogPath();
-	const line = JSON.stringify(sample) + '\n';
-	
-	fs.appendFile(logPath, line, (err) => {
-		if (err) {
-			console.error('[crowd-pilot] Failed to log preference sample:', err);
-		} else {
-			console.log(`[crowd-pilot] Logged preference sample, outcome: (${sample.outcome})`);
-		}
-	});
+function logRejectFollowupSample(sample: RejectFollowupSample): void {
+	appendPreferenceLogRecord(sample, `[crowd-pilot] Logged reject followup sample for ${sample.sampleId}`);
+}
+
+function captureEditorFileState(editor: vscode.TextEditor): PreferenceFileState {
+	const doc = editor.document;
+	return {
+		uri: doc.uri.toString(),
+		fsPath: doc.uri.fsPath,
+		languageId: doc.languageId,
+		version: doc.version,
+		text: doc.getText(),
+		selections: editor.selections.map((selection) => ({
+			start: [selection.start.line, selection.start.character],
+			end: [selection.end.line, selection.end.character],
+		})),
+	};
 }
 
 /**
@@ -103,15 +222,21 @@ function logPreferenceSample(sample: PreferenceSample): void {
  * This captures all context needed for reward model training.
  */
 function createPendingPreferenceSample(
+	prompt: PreferencePrompt,
 	conversationMessages: Array<{ role: string; content: string }>,
+	fileState: PreferenceFileState,
 	rawModelOutput: string,
 	parsedAction: Action | null,
 	avgLogprob: number,
 	modelName: string
 ): void {
 	const sample: PreferenceSample = {
+		type: 'preference_sample',
+		sampleId: createModelLogId(),
 		timestamp: Date.now(),
+		prompt,
 		context: conversationMessages,
+		fileState,
 		completion: {
 			rawModelOutput,
 			parsedAction,
@@ -119,6 +244,7 @@ function createPendingPreferenceSample(
 		},
 		outcome: null,
 		outcomeTimestamp: null,
+		outcomeSource: null,
 		modelName,
 	};
 
@@ -131,18 +257,24 @@ function createPendingPreferenceSample(
 /**
  * Record the outcome of the current pending sample and log it.
  */
-function recordPreferenceOutcome(outcome: 'accepted' | 'rejected' | 'ignored'): void {
+function recordPreferenceOutcome(
+	outcome: PreferenceOutcome,
+	outcomeSource: PreferenceOutcomeSource
+): { sampleId: string; outcomeTimestamp: number } | null {
 	if (!pendingPreferenceSample) {
-		return;
+		return null;
 	}
 
 	const sample = pendingPreferenceSample.sample;
+	const outcomeTimestamp = Date.now();
 	sample.outcome = outcome;
-	sample.outcomeTimestamp = Date.now();
+	sample.outcomeTimestamp = outcomeTimestamp;
+	sample.outcomeSource = outcomeSource;
 
 	logPreferenceSample(sample);
 
 	pendingPreferenceSample = null;
+	return { sampleId: sample.sampleId, outcomeTimestamp };
 }
 
 /**
@@ -150,8 +282,236 @@ function recordPreferenceOutcome(outcome: 'accepted' | 'rejected' | 'ignored'): 
  */
 function markPendingAsIgnored(): void {
 	if (pendingPreferenceSample) {
-		recordPreferenceOutcome('ignored');
+		recordPreferenceOutcome('ignored', 'auto_ignored');
 	}
+}
+
+function clearRejectCaptureState(): void {
+	if (rejectCaptureState?.cursorMoveTimer) {
+		clearTimeout(rejectCaptureState.cursorMoveTimer);
+	}
+	if (rejectCaptureState?.phase === 'active' && rejectCaptureState.inactivityTimer) {
+		clearTimeout(rejectCaptureState.inactivityTimer);
+	}
+	rejectCaptureState = null;
+}
+
+function armRejectCapture(sampleId: string, rejectedAt: number): void {
+	clearRejectCaptureState();
+	rejectCaptureState = {
+		phase: 'armed',
+		sampleId,
+		rejectedAt,
+		originDocUri: vscode.window.activeTextEditor?.document.uri.toString() ?? null,
+		cursorMoveTimer: null,
+	};
+}
+
+function resetRejectCaptureTimer(state: ActiveRejectCaptureState): void {
+	if (state.inactivityTimer) {
+		clearTimeout(state.inactivityTimer);
+	}
+	const rawPauseMs = getConfig().rejectFollowupPauseMs;
+	const pauseMs = Number.isFinite(rawPauseMs) ? Math.max(0, Math.floor(rawPauseMs)) : 5000;
+	state.inactivityTimer = setTimeout(() => {
+		finalizeRejectCapture('pause', null);
+	}, pauseMs);
+}
+
+function calculateRejectFollowupStats(edits: RejectFollowupEditEvent[]): {
+	editEventCount: number;
+	contentChangeCount: number;
+	charsInserted: number;
+	charsDeleted: number;
+} {
+	let contentChangeCount = 0;
+	let charsInserted = 0;
+	let charsDeleted = 0;
+	for (const edit of edits) {
+		contentChangeCount += edit.contentChanges.length;
+		for (const change of edit.contentChanges) {
+			charsInserted += change.text.length;
+			charsDeleted += change.rangeLength;
+		}
+	}
+	return {
+		editEventCount: edits.length,
+		contentChangeCount,
+		charsInserted,
+		charsDeleted,
+	};
+}
+
+function finalizeRejectCapture(
+	stopReason: RejectFollowupStopReason,
+	anotherActionType: RejectFollowupAnotherActionType | null
+): void {
+	if (!rejectCaptureState) {
+		return;
+	}
+	if (rejectCaptureState.phase === 'armed') {
+		clearRejectCaptureState();
+		return;
+	}
+	const state = rejectCaptureState;
+	clearRejectCaptureState();
+	if (state.edits.length === 0) {
+		return;
+	}
+
+	const followup: RejectFollowupSample = {
+		type: 'reject_followup',
+		sampleId: state.sampleId,
+		rejectedAt: state.rejectedAt,
+		firstEditAt: state.firstEditAt,
+		endedAt: Date.now(),
+		stopReason,
+		anotherActionType,
+		docUri: state.docUri,
+		edits: state.edits,
+		stats: calculateRejectFollowupStats(state.edits),
+	};
+	logRejectFollowupSample(followup);
+}
+
+function stopRejectCaptureForAnotherAction(actionType: RejectFollowupAnotherActionType): void {
+	if (!rejectCaptureState) {
+		return;
+	}
+	if (rejectCaptureState.phase === 'armed') {
+		clearRejectCaptureState();
+		return;
+	}
+	finalizeRejectCapture('another_action', actionType);
+}
+
+function scheduleRejectCaptureCursorStop(): void {
+	if (!rejectCaptureState) {
+		return;
+	}
+	if (rejectCaptureState.cursorMoveTimer) {
+		clearTimeout(rejectCaptureState.cursorMoveTimer);
+	}
+	rejectCaptureState.cursorMoveTimer = setTimeout(() => {
+		if (!rejectCaptureState) {
+			return;
+		}
+		stopRejectCaptureForAnotherAction('cursor_move');
+	}, REJECT_CAPTURE_CURSOR_GRACE_MS);
+}
+
+function captureRejectFollowupEdit(e: vscode.TextDocumentChangeEvent): void {
+	if (!rejectCaptureState || e.contentChanges.length === 0) {
+		return;
+	}
+
+	if (rejectCaptureState.phase === 'armed') {
+		if (rejectCaptureState.cursorMoveTimer) {
+			clearTimeout(rejectCaptureState.cursorMoveTimer);
+		}
+		rejectCaptureState = {
+			phase: 'active',
+			sampleId: rejectCaptureState.sampleId,
+			rejectedAt: rejectCaptureState.rejectedAt,
+			docUri: e.document.uri.toString(),
+			firstEditAt: Date.now(),
+			edits: [],
+			inactivityTimer: null,
+			pendingSelectionSkipVersion: null,
+			cursorMoveTimer: null,
+		};
+	}
+
+	if (rejectCaptureState.phase !== 'active') {
+		return;
+	}
+
+	if (rejectCaptureState.docUri !== e.document.uri.toString()) {
+		stopRejectCaptureForAnotherAction('file_switch');
+		return;
+	}
+	if (rejectCaptureState.cursorMoveTimer) {
+		clearTimeout(rejectCaptureState.cursorMoveTimer);
+		rejectCaptureState.cursorMoveTimer = null;
+	}
+
+	const editEvent: RejectFollowupEditEvent = {
+		ts: Date.now(),
+		docVersion: e.document.version,
+		contentChanges: e.contentChanges.map((change) => ({
+			rangeOffset: change.rangeOffset,
+			rangeLength: change.rangeLength,
+			text: change.text,
+		})),
+	};
+	rejectCaptureState.edits.push(editEvent);
+	rejectCaptureState.pendingSelectionSkipVersion = e.document.version;
+	resetRejectCaptureTimer(rejectCaptureState);
+}
+
+function handleRejectCaptureSelectionChange(e: vscode.TextEditorSelectionChangeEvent): void {
+	if (!rejectCaptureState) {
+		return;
+	}
+
+	const currentDocUri = e.textEditor.document.uri.toString();
+	if (rejectCaptureState.phase === 'armed') {
+		if (rejectCaptureState.originDocUri && currentDocUri !== rejectCaptureState.originDocUri) {
+			stopRejectCaptureForAnotherAction('file_switch');
+			return;
+		}
+		if (e.kind === vscode.TextEditorSelectionChangeKind.Mouse || e.kind === vscode.TextEditorSelectionChangeKind.Command) {
+			stopRejectCaptureForAnotherAction('cursor_move');
+			return;
+		}
+		scheduleRejectCaptureCursorStop();
+		return;
+	}
+
+	if (currentDocUri !== rejectCaptureState.docUri) {
+		stopRejectCaptureForAnotherAction('file_switch');
+		return;
+	}
+
+	if (
+		rejectCaptureState.pendingSelectionSkipVersion !== null
+		&& e.textEditor.document.version === rejectCaptureState.pendingSelectionSkipVersion
+	) {
+		rejectCaptureState.pendingSelectionSkipVersion = null;
+		return;
+	}
+
+	if (e.kind === vscode.TextEditorSelectionChangeKind.Mouse || e.kind === vscode.TextEditorSelectionChangeKind.Command) {
+		stopRejectCaptureForAnotherAction('cursor_move');
+		return;
+	}
+	scheduleRejectCaptureCursorStop();
+}
+
+function handleRejectCaptureEditorSwitch(editor: vscode.TextEditor | undefined): void {
+	if (!rejectCaptureState) {
+		return;
+	}
+	const nextUri = editor?.document.uri.toString() ?? null;
+	if (rejectCaptureState.phase === 'armed') {
+		if (rejectCaptureState.originDocUri && nextUri === rejectCaptureState.originDocUri) {
+			return;
+		}
+		stopRejectCaptureForAnotherAction('file_switch');
+		return;
+	}
+	if (nextUri !== rejectCaptureState.docUri) {
+		stopRejectCaptureForAnotherAction('file_switch');
+	}
+}
+
+function recordRejectAndArmCapture(source: 'escape_dismiss' | 'quickpick_dismiss'): void {
+	const recorded = recordPreferenceOutcome('rejected', source);
+	if (!recorded) {
+		clearRejectCaptureState();
+		return;
+	}
+	armRejectCapture(recorded.sampleId, recorded.outcomeTimestamp);
 }
 
 
@@ -171,6 +531,7 @@ function getConfig() {
 		sweepOpenedFileContext: config.get<string>('sweepOpenedFileContext', 'full'),
 		sweepHistoryCenter: config.get<string>('sweepHistoryCenter', 'changed'),
 		sweepMaxHistoryEntries: config.get<number>('sweepMaxHistoryEntries', 64),
+		rejectFollowupPauseMs: config.get<number>('rejectFollowupPauseMs', 5000),
 	};
 }
 
@@ -193,6 +554,7 @@ function clearContext(): void {
 	conversationManager.reset();
 	activatedFiles.clear();
 	lastPredictionContext = null;
+	clearRejectCaptureState();
 	console.log('[crowd-pilot] Context cleared');
 }
 
@@ -268,7 +630,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
-		recordPreferenceOutcome('rejected');
+		recordRejectAndArmCapture('escape_dismiss');
 		hidePreviewUI(true);
 	});
 
@@ -308,7 +670,8 @@ export function activate(context: vscode.ExtensionContext) {
 				hidePreviewUI();
 				return;
 			}
-			recordPreferenceOutcome('accepted');
+			recordPreferenceOutcome('accepted', 'tab_accept');
+			clearRejectCaptureState();
 			hidePreviewUI(false);
 			await executeAction(action);
 			autoShowNextAction();
@@ -326,12 +689,13 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		const result = await previewManager.showQuickPick();
 		if (result === 'accept') {
-			recordPreferenceOutcome('accepted');
+			recordPreferenceOutcome('accepted', 'quickpick_accept');
+			clearRejectCaptureState();
 			hidePreviewUI(false);
 			await executeAction(currentAction);
 			autoShowNextAction();
 		} else if (result === 'dismiss') {
-			recordPreferenceOutcome('rejected');
+			recordRejectAndArmCapture('quickpick_dismiss');
 			hidePreviewUI(true);
 		}
 	});
@@ -347,6 +711,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const onSelChange = vscode.window.onDidChangeTextEditorSelection((e) => {
 		if (e.textEditor === vscode.window.activeTextEditor) {
+			handleRejectCaptureSelectionChange(e);
 			suppressAutoPreview = false;
 			schedulePredictionRefresh(true, false);
 
@@ -361,6 +726,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const onActiveChange = vscode.window.onDidChangeActiveTextEditor((editor) => {
+		handleRejectCaptureEditorSwitch(editor);
 		suppressAutoPreview = false;
 		schedulePredictionRefresh(true, false);
 
@@ -380,6 +746,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
 		if (vscode.window.activeTextEditor?.document === e.document) {
+			captureRejectFollowupEdit(e);
 			suppressAutoPreview = false;
 			schedulePredictionRefresh(true, false);
 
@@ -396,12 +763,14 @@ export function activate(context: vscode.ExtensionContext) {
 	// Terminal focus event
 	const onTerminalChange = vscode.window.onDidChangeActiveTerminal((terminal) => {
 		if (terminal) {
+			stopRejectCaptureForAnotherAction('terminal_focus');
 			conversationManager.handleTerminalFocusEvent();
 		}
 	});
 
 	// Terminal command execution event
 	const onTerminalCommand = vscode.window.onDidStartTerminalShellExecution(async (event) => {
+		stopRejectCaptureForAnotherAction('terminal_command');
 		const commandLine = event.execution.commandLine.value;
 		conversationManager.handleTerminalCommandEvent(commandLine);
 
@@ -439,6 +808,7 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {
+	clearRejectCaptureState();
 	previewManager?.dispose();
 }
 
@@ -876,17 +1246,28 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		currentWindow: String(promptPayload.currentWindow ?? ''),
 	};
 
-	const requestBody: any = {
+	const prompt: PreferencePrompt = {
 		model: cfg.modelName,
-		messages: conversationMessages
+		messages: conversationMessages,
+		temperature: 0.7,
+		top_p: 0.8,
+		top_k: 20,
+		min_p: 0,
+		logprobs: true,
+		chat_template_kwargs: {
+			enable_thinking: false
+		},
 	};
-	requestBody.temperature = 0.7;
-	requestBody.top_p = 0.8;
-	requestBody.top_k = 20;
-	requestBody.min_p = 0;
-	requestBody.logprobs = true;
-	requestBody.chat_template_kwargs = {
-		enable_thinking: false
+
+	const requestBody: any = {
+		model: prompt.model,
+		messages: prompt.messages,
+		temperature: prompt.temperature,
+		top_p: prompt.top_p,
+		top_k: prompt.top_k,
+		min_p: prompt.min_p,
+		logprobs: prompt.logprobs,
+		chat_template_kwargs: prompt.chat_template_kwargs,
 	};
 	const requestId = createModelLogId();
 	try {
@@ -961,11 +1342,14 @@ async function requestModelActions(editor: vscode.TextEditor, signal?: AbortSign
 		docVersion: currentDoc.version,
 		actionLineRange: actionLineRange(action),
 	};
+	const fileState = captureEditorFileState(editor);
 
 	markPendingAsIgnored();
 
 	createPendingPreferenceSample(
+		prompt,
 		conversationMessages,
+		fileState,
 		content,
 		action,
 		avgLogprob,

@@ -131,6 +131,12 @@
           "minimum": 0,
           "default": 300,
           "description": "Minimum interval in milliseconds between prediction requests"
+        },
+        "crowd-pilot.rejectFollowupPauseMs": {
+          "type": "number",
+          "minimum": 0,
+          "default": 5000,
+          "description": "Inactivity threshold in milliseconds for ending post-reject follow-up edit capture"
         }
       }
     },
