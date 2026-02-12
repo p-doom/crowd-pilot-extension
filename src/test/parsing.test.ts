@@ -1,4 +1,5 @@
 import * as assert from 'assert';
+import { advancePositionByText, dropSingleTrailingNewline } from '../utils/cursor';
 import {
 	computeChangedLineRange,
 	computeMinimalChangeRange,
@@ -8,6 +9,46 @@ import {
 } from '../utils/parsing';
 
 suite('Parsing Utilities', () => {
+	suite('advancePositionByText', () => {
+		test('advances on same line', () => {
+			assert.deepStrictEqual(advancePositionByText([4, 2], 'abc'), [4, 5]);
+		});
+
+		test('advances across multiple lines', () => {
+			assert.deepStrictEqual(advancePositionByText([10, 4], 'foo\nbar'), [11, 3]);
+		});
+
+		test('handles trailing newline', () => {
+			assert.deepStrictEqual(advancePositionByText([1, 2], 'foo\n'), [2, 0]);
+		});
+
+		test('normalizes CRLF/CR line endings', () => {
+			assert.deepStrictEqual(advancePositionByText([0, 0], 'a\r\nbb\rc'), [2, 1]);
+		});
+
+		test('returns same position for empty text', () => {
+			assert.deepStrictEqual(advancePositionByText([3, 7], ''), [3, 7]);
+		});
+	});
+
+	suite('dropSingleTrailingNewline', () => {
+		test('drops one trailing LF', () => {
+			assert.strictEqual(dropSingleTrailingNewline('abc\n'), 'abc');
+		});
+
+		test('drops one trailing CRLF', () => {
+			assert.strictEqual(dropSingleTrailingNewline('abc\r\n'), 'abc');
+		});
+
+		test('drops only one trailing newline when multiple exist', () => {
+			assert.strictEqual(dropSingleTrailingNewline('abc\n\n'), 'abc\n');
+		});
+
+		test('returns unchanged text when there is no trailing newline', () => {
+			assert.strictEqual(dropSingleTrailingNewline('abc'), 'abc');
+		});
+	});
+
 	suite('extractLastCodeBlock', () => {
 		test('extracts last fenced block', () => {
 			const text = [

@@ -9,9 +9,9 @@ export type SweepParsedEdit = {
 };
 
 export type SweepAction =
-	| { kind: 'editInsert'; position: [number, number]; text: string }
+	| { kind: 'editInsert'; position: [number, number]; text: string; autoAppendedTrailingNewline?: boolean }
 	| { kind: 'editDelete'; range: { start: [number, number]; end: [number, number] } }
-	| { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }
+	| { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string; autoAppendedTrailingNewline?: boolean }
 	| { kind: 'openFile'; filePath: string };
 
 export type DocSnapshot = {
@@ -93,11 +93,13 @@ function sweepReplaceAction(startLine1: number, endLine1: number, text: string, 
 		endPosChar = doc.lastLineLength;
 	}
 	const normalizedText = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-	const payload = normalizedText.endsWith('\n') ? normalizedText : `${normalizedText}\n`;
+	const autoAppendedTrailingNewline = !normalizedText.endsWith('\n');
+	const payload = autoAppendedTrailingNewline ? `${normalizedText}\n` : normalizedText;
 	return {
 		kind: 'editReplace',
 		range: { start: [startLine0, 0], end: [endPosLine, endPosChar] },
 		text: payload,
+		...(autoAppendedTrailingNewline ? { autoAppendedTrailingNewline: true } : {}),
 	};
 }
 
@@ -106,7 +108,8 @@ function sweepInsertAction(startLine1: number, text: string, doc: DocSnapshot): 
 	if (!normalizedText) {
 		return undefined;
 	}
-	const payload = normalizedText.endsWith('\n') ? normalizedText : `${normalizedText}\n`;
+	const autoAppendedTrailingNewline = !normalizedText.endsWith('\n');
+	const payload = autoAppendedTrailingNewline ? `${normalizedText}\n` : normalizedText;
 	const insertLine0 = Math.max(0, startLine1 - 1);
 	if (insertLine0 >= doc.lineCount) {
 		const needsLeadingNewline = doc.lineCount > 0;
@@ -114,11 +117,13 @@ function sweepInsertAction(startLine1: number, text: string, doc: DocSnapshot): 
 			kind: 'editInsert',
 			position: [doc.lineCount, 0],
 			text: needsLeadingNewline ? `\n${payload}` : payload,
+			...(autoAppendedTrailingNewline ? { autoAppendedTrailingNewline: true } : {}),
 		};
 	}
 	return {
 		kind: 'editInsert',
 		position: [insertLine0, 0],
 		text: payload,
+		...(autoAppendedTrailingNewline ? { autoAppendedTrailingNewline: true } : {}),
 	};
 }
