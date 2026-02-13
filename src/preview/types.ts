@@ -6,9 +6,9 @@ import * as vscode from 'vscode';
 export type Action =
     | { kind: 'showTextDocument' }
     | { kind: 'setSelections'; selections: Array<{ start: [number, number]; end: [number, number] }> }
-    | { kind: 'editInsert'; position: [number, number]; text: string }
+    | { kind: 'editInsert'; position: [number, number]; text: string; autoAppendedTrailingNewline?: boolean }
     | { kind: 'editDelete'; range: { start: [number, number]; end: [number, number] } }
-    | { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string }
+    | { kind: 'editReplace'; range: { start: [number, number]; end: [number, number] }; text: string; autoAppendedTrailingNewline?: boolean }
     | { kind: 'terminalShow' }
     | { kind: 'terminalSendText'; text: string }
     | { kind: 'openFile'; filePath: string; selections?: Array<{ start: [number, number]; end: [number, number] }> };
@@ -40,5 +40,4 @@ export function truncate(text: string, maxLength: number): string {
     }
     return oneLine.slice(0, maxLength - 1) + '…';
 }
-
 
