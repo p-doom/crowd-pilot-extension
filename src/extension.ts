@@ -6,6 +6,7 @@ import { Buffer } from 'buffer';
 import { SweepConversationStateManager } from '@crowd-pilot/serializer';
 import { PreviewManager, Action } from './preview';
 import { parsedSweepEditToAction, SweepParsedEdit } from './utils/sweepAction';
+import { advancePositionByText, dropSingleTrailingNewline } from './utils/cursor';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -452,6 +453,40 @@ function getActiveOrCreateTerminal(): vscode.Terminal {
 	return vscode.window.createTerminal('crowd-pilot');
 }
 
+function clampPositionToDocument(
+	doc: vscode.TextDocument,
+	position: vscode.Position
+): vscode.Position {
+	if (doc.lineCount <= 0) {
+		return new vscode.Position(0, 0);
+	}
+	const line = Math.min(Math.max(position.line, 0), doc.lineCount - 1);
+	const maxChar = doc.lineAt(line).text.length;
+	const character = Math.min(Math.max(position.character, 0), maxChar);
+	return new vscode.Position(line, character);
+}
+
+function normalizeActionPosition(
+	doc: vscode.TextDocument,
+	position: [number, number]
+): vscode.Position {
+	if (doc.lineCount <= 0) {
+		return new vscode.Position(0, 0);
+	}
+	const [line, character] = position;
+	if (line >= doc.lineCount) {
+		return doc.lineAt(doc.lineCount - 1).range.end;
+	}
+	return clampPositionToDocument(doc, new vscode.Position(line, character));
+}
+
+function setCursorPosition(editor: vscode.TextEditor, position: vscode.Position): void {
+	const clamped = clampPositionToDocument(editor.document, position);
+	const selection = new vscode.Selection(clamped, clamped);
+	editor.selections = [selection];
+	editor.revealRange(selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+}
+
 async function executeAction(action: Action): Promise<void> {
 	const editor = vscode.window.activeTextEditor;
 	if (!editor) { return; }
@@ -469,23 +504,50 @@ async function executeAction(action: Action): Promise<void> {
 		return;
 	}
 	if (action.kind === 'editInsert') {
-		await editor.edit((e: vscode.TextEditorEdit) => e.insert(new vscode.Position(action.position[0], action.position[1]), action.text));
+		const insertPosition = normalizeActionPosition(doc, action.position);
+		const cursorText = dropSingleTrailingNewline(action.text);
+		const [endLine, endCharacter] = advancePositionByText(
+			[insertPosition.line, insertPosition.character],
+			cursorText
+		);
+		const applied = await editor.edit((e: vscode.TextEditorEdit) => e.insert(insertPosition, action.text));
+		if (!applied) {
+			return;
+		}
+		setCursorPosition(editor, new vscode.Position(endLine, endCharacter));
 		return;
 	}
 	if (action.kind === 'editDelete') {
+		const startPosition = normalizeActionPosition(doc, action.range.start);
+		const endPosition = normalizeActionPosition(doc, action.range.end);
 		const range = new vscode.Range(
-			new vscode.Position(action.range.start[0], action.range.start[1]),
-			new vscode.Position(action.range.end[0], action.range.end[1])
+			startPosition,
+			endPosition
 		);
-		await editor.edit((e: vscode.TextEditorEdit) => e.delete(range));
+		const applied = await editor.edit((e: vscode.TextEditorEdit) => e.delete(range));
+		if (!applied) {
+			return;
+		}
+		setCursorPosition(editor, startPosition);
 		return;
 	}
 	if (action.kind === 'editReplace') {
+		const startPosition = normalizeActionPosition(doc, action.range.start);
+		const endPosition = normalizeActionPosition(doc, action.range.end);
 		const range = new vscode.Range(
-			new vscode.Position(action.range.start[0], action.range.start[1]),
-			new vscode.Position(action.range.end[0], action.range.end[1])
+			startPosition,
+			endPosition
 		);
-		await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
+		const cursorText = dropSingleTrailingNewline(action.text);
+		const [endLine, endCharacter] = advancePositionByText(
+			[startPosition.line, startPosition.character],
+			cursorText
+		);
+		const applied = await editor.edit((e: vscode.TextEditorEdit) => e.replace(range, action.text));
+		if (!applied) {
+			return;
+		}
+		setCursorPosition(editor, new vscode.Position(endLine, endCharacter));
 		return;
 	}
 	if (action.kind === 'terminalShow') {
