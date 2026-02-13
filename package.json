@@ -137,6 +137,17 @@
           "minimum": 0,
           "default": 5000,
           "description": "Inactivity threshold in milliseconds for ending post-reject follow-up edit capture"
+        },
+        "crowd-pilot.acceptFollowupPauseMs": {
+          "type": "number",
+          "minimum": 0,
+          "default": 5000,
+          "description": "Inactivity threshold in milliseconds for ending post-accept follow-up edit capture"
+        },
+        "crowd-pilot.enablePreferenceUpload": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable periodic upload of local indexed preference log files every 5 minutes (uses CROWD_PILOT_API_GATEWAY_URL/CROWD_CODE_API_GATEWAY_URL)."
         }
       }
     },

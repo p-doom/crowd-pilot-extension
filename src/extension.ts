@@ -6,6 +6,7 @@ import { Buffer } from 'buffer';
 import { SweepConversationStateManager } from '@crowd-pilot/serializer';
 import { PreviewManager, Action } from './preview';
 import { parsedSweepEditToAction, SweepParsedEdit } from './utils/sweepAction';
+import { diffChars } from './utils/diff';
 
 // -------------------- Preference Data Collection --------------------
 
@@ -100,6 +101,48 @@ interface RejectFollowupSample {
 	};
 }
 
+type AcceptFollowupStopReason = 'pause' | 'another_action';
+type AcceptFollowupAnotherActionType =
+	| 'cursor_far'
+	| 'file_switch'
+	| 'terminal_focus'
+	| 'terminal_command'
+	| 'new_suggestion';
+type AcceptFollowupRelationship = 'none' | 'refinement' | 'continuation' | 'mixed';
+
+interface AcceptFollowupSample {
+	type: 'accept_followup';
+	sampleId: string;
+	acceptedAt: number;
+	firstEditAt: number | null;
+	endedAt: number;
+	stopReason: AcceptFollowupStopReason;
+	anotherActionType: AcceptFollowupAnotherActionType | null;
+	docUri: string;
+	initialRegion: {
+		startLine: number;
+		endLine: number;
+	};
+	finalRegion: {
+		startLine: number;
+		endLine: number;
+	};
+	baseFileState: PreferenceFileState;
+	finalFileState: PreferenceFileState;
+	edits: RejectFollowupEditEvent[];
+	relationship: AcceptFollowupRelationship;
+	stats: {
+		editEventCount: number;
+		contentChangeCount: number;
+		charsInserted: number;
+		charsDeleted: number;
+	};
+	metrics: {
+		acceptedRegionCharEditDistance: number | null;
+		fullFileCharEditDistance: number | null;
+	};
+}
+
 type ArmedRejectCaptureState = {
 	phase: 'armed';
 	sampleId: string;
@@ -122,9 +165,56 @@ type ActiveRejectCaptureState = {
 
 type RejectCaptureState = ArmedRejectCaptureState | ActiveRejectCaptureState;
 
+type ActiveAcceptCaptureState = {
+	sampleId: string;
+	acceptedAt: number;
+	docUri: string;
+	baseFileState: PreferenceFileState;
+	initialRegionStartLine: number;
+	initialRegionEndLine: number;
+	regionStartLine: number;
+	regionEndLine: number;
+	edits: RejectFollowupEditEvent[];
+	firstEditAt: number | null;
+	inactivityTimer: NodeJS.Timeout | null;
+	pendingSelectionSkipVersion: number | null;
+	touchedRegionChangeCount: number;
+	outsideRegionChangeCount: number;
+};
+
+interface IndexedPreferenceLogFile {
+	index: number;
+	name: string;
+	filePath: string;
+}
+
+interface PreferenceLogTarget {
+	basePath: string;
+	dir: string;
+	stem: string;
+	ext: string;
+}
+
+type PreferenceLogState = {
+	stateKey: string;
+	currentIndex: number;
+	currentLineCount: number;
+};
+
 let pendingPreferenceSample: PendingPreferenceSample | null = null;
 let rejectCaptureState: RejectCaptureState | null = null;
+let acceptCaptureState: ActiveAcceptCaptureState | null = null;
 const REJECT_CAPTURE_CURSOR_GRACE_MS = 75;
+const PREFERENCE_LOG_INDEX_PADDING = 6;
+const PREFERENCE_UPLOAD_INTERVAL_MS = 5 * 60 * 1000;
+const DEFAULT_PREFERENCE_LOG_MAX_LINES_PER_FILE = 500;
+const PREFERENCE_UPLOAD_API_GATEWAY_URL = process.env.CROWD_PILOT_API_GATEWAY_URL || '';
+
+let preferenceLogState: PreferenceLogState | null = null;
+let preferenceLogQueue: Promise<void> = Promise.resolve();
+let preferenceUploadIntervalId: NodeJS.Timeout | null = null;
+let preferenceUploadExtensionVersion = '0.0.0';
+let preferenceUploadUserId = '';
 
 function getPreferenceLogPath(): string {
 	const cfg = getConfig();
@@ -140,6 +230,298 @@ function getPreferenceLogPath(): string {
 
 function getPreferenceLogDir(): string {
 	return path.dirname(getPreferenceLogPath());
+}
+
+function getPreferenceLogTarget(): PreferenceLogTarget {
+	const basePath = getPreferenceLogPath();
+	const dir = path.dirname(basePath);
+	const parsed = path.parse(basePath);
+	const ext = parsed.ext || '.jsonl';
+	return {
+		basePath,
+		dir,
+		stem: parsed.name,
+		ext,
+	};
+}
+
+function getPreferenceLogMaxLinesPerFile(): number {
+	return DEFAULT_PREFERENCE_LOG_MAX_LINES_PER_FILE;
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function formatPreferenceLogIndex(index: number): string {
+	return String(index).padStart(PREFERENCE_LOG_INDEX_PADDING, '0');
+}
+
+function preferenceLogFilePathForIndex(target: PreferenceLogTarget, index: number): string {
+	const fileName = `${target.stem}.${formatPreferenceLogIndex(index)}${target.ext}`;
+	return path.join(target.dir, fileName);
+}
+
+function parseIndexedPreferenceLogName(target: PreferenceLogTarget, fileName: string): number | null {
+	const pattern = new RegExp(`^${escapeRegex(target.stem)}\\.(\\d+)${escapeRegex(target.ext)}$`);
+	const match = pattern.exec(fileName);
+	if (!match) {
+		return null;
+	}
+	const index = Number.parseInt(match[1], 10);
+	return Number.isFinite(index) ? index : null;
+}
+
+async function listIndexedPreferenceLogFiles(target: PreferenceLogTarget): Promise<IndexedPreferenceLogFile[]> {
+	let entries: fs.Dirent[];
+	try {
+		entries = await fs.promises.readdir(target.dir, { withFileTypes: true });
+	} catch (err: unknown) {
+		if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+			return [];
+		}
+		throw err;
+	}
+	const files: IndexedPreferenceLogFile[] = [];
+	for (const entry of entries) {
+		if (!entry.isFile()) {
+			continue;
+		}
+		const index = parseIndexedPreferenceLogName(target, entry.name);
+		if (index === null) {
+			continue;
+		}
+		files.push({
+			index,
+			name: entry.name,
+			filePath: path.join(target.dir, entry.name),
+		});
+	}
+	files.sort((a, b) => a.index - b.index);
+	return files;
+}
+
+function countJsonlLines(contents: string): number {
+	if (contents.length === 0) {
+		return 0;
+	}
+	return contents.split('\n').filter((line) => line.length > 0).length;
+}
+
+async function ensurePreferenceLogState(): Promise<void> {
+	const target = getPreferenceLogTarget();
+	const maxLines = getPreferenceLogMaxLinesPerFile();
+	const stateKey = `${target.basePath}::${maxLines}`;
+	if (preferenceLogState?.stateKey === stateKey) {
+		return;
+	}
+
+	await fs.promises.mkdir(target.dir, { recursive: true });
+
+	const indexedFiles = await listIndexedPreferenceLogFiles(target);
+	if (indexedFiles.length === 0) {
+		preferenceLogState = {
+			stateKey,
+			currentIndex: 1,
+			currentLineCount: 0,
+		};
+		return;
+	}
+
+	const latestFile = indexedFiles[indexedFiles.length - 1];
+	let currentLineCount = 0;
+	try {
+		const contents = await fs.promises.readFile(latestFile.filePath, 'utf8');
+		currentLineCount = countJsonlLines(contents);
+	} catch (err: unknown) {
+		if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw err;
+		}
+	}
+
+	if (currentLineCount >= maxLines) {
+		preferenceLogState = {
+			stateKey,
+			currentIndex: latestFile.index + 1,
+			currentLineCount: 0,
+		};
+		return;
+	}
+
+	preferenceLogState = {
+		stateKey,
+		currentIndex: latestFile.index,
+		currentLineCount,
+	};
+}
+
+async function appendPreferenceLogLine(line: string): Promise<void> {
+	await ensurePreferenceLogState();
+	if (!preferenceLogState) {
+		return;
+	}
+	const maxLines = getPreferenceLogMaxLinesPerFile();
+	if (preferenceLogState.currentLineCount >= maxLines) {
+		preferenceLogState.currentIndex += 1;
+		preferenceLogState.currentLineCount = 0;
+	}
+	const target = getPreferenceLogTarget();
+	const filePath = preferenceLogFilePathForIndex(target, preferenceLogState.currentIndex);
+	await fs.promises.appendFile(filePath, line, 'utf8');
+	preferenceLogState.currentLineCount += 1;
+}
+
+function enqueuePreferenceLogTask(task: () => Promise<void>): Promise<void> {
+	const run = preferenceLogQueue.then(task);
+	preferenceLogQueue = run.catch((err) => {
+		console.error('[crowd-pilot] Preference log task failed:', err);
+	});
+	return run;
+}
+
+function getPreferenceUploadApiUrl(): string {
+	return PREFERENCE_UPLOAD_API_GATEWAY_URL.trim();
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), timeoutMs);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function uploadPreferenceLogFile(fileName: string, contents: string): Promise<boolean> {
+	const uploadApiUrl = getPreferenceUploadApiUrl();
+	if (!uploadApiUrl) {
+		console.log('[crowd-pilot] Preference upload skipped: no upload API URL configured.');
+		return false;
+	}
+	try {
+		const presignResponse = await fetchWithTimeout(uploadApiUrl, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				fileName,
+				version: preferenceUploadExtensionVersion,
+				userId: preferenceUploadUserId,
+			}),
+		}, 10_000);
+		if (!presignResponse.ok) {
+			const body = await presignResponse.text();
+			throw new Error(`Presign request failed: ${presignResponse.status} ${body}`);
+		}
+		const payload = await presignResponse.json() as { uploadUrl?: string };
+		if (!payload.uploadUrl || typeof payload.uploadUrl !== 'string') {
+			throw new Error('Invalid presign response: missing uploadUrl');
+		}
+		const uploadResponse = await fetchWithTimeout(payload.uploadUrl, {
+			method: 'PUT',
+			headers: {
+				'Content-Type': 'application/x-ndjson',
+			},
+			body: Buffer.from(contents, 'utf8'),
+		}, 60_000);
+		if (!uploadResponse.ok) {
+			const body = await uploadResponse.text();
+			throw new Error(`Upload failed: ${uploadResponse.status} ${body}`);
+		}
+		console.log(`[crowd-pilot] Uploaded preference log file ${fileName}`);
+		return true;
+	} catch (err) {
+		console.error(`[crowd-pilot] Failed to upload preference log file ${fileName}:`, err);
+		return false;
+	}
+}
+
+async function uploadAllLocalPreferenceLogs(): Promise<void> {
+	const cfg = getConfig();
+	if (!cfg.enablePreferenceUpload) {
+		return;
+	}
+	const uploadApiUrl = getPreferenceUploadApiUrl();
+	if (!uploadApiUrl) {
+		return;
+	}
+
+	await ensurePreferenceLogState();
+	const target = getPreferenceLogTarget();
+	const indexedFiles = await listIndexedPreferenceLogFiles(target);
+	if (indexedFiles.length === 0) {
+		return;
+	}
+
+	for (const file of indexedFiles) {
+		let contents = '';
+		try {
+			contents = await fs.promises.readFile(file.filePath, 'utf8');
+		} catch (err: unknown) {
+			if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+				continue;
+			}
+			throw err;
+		}
+
+		if (countJsonlLines(contents) === 0) {
+			await fs.promises.unlink(file.filePath).catch(() => undefined);
+			if (preferenceLogState && preferenceLogState.currentIndex === file.index) {
+				preferenceLogState.currentIndex += 1;
+				preferenceLogState.currentLineCount = 0;
+			}
+			continue;
+		}
+
+		const uploaded = await uploadPreferenceLogFile(file.name, contents);
+		if (!uploaded) {
+			break;
+		}
+
+		await fs.promises.unlink(file.filePath).catch(() => undefined);
+		if (preferenceLogState && preferenceLogState.currentIndex === file.index) {
+			preferenceLogState.currentIndex += 1;
+			preferenceLogState.currentLineCount = 0;
+		}
+	}
+}
+
+function startPreferenceUploadInterval(): void {
+	stopPreferenceUploadInterval();
+	preferenceUploadIntervalId = setInterval(() => {
+		void enqueuePreferenceLogTask(uploadAllLocalPreferenceLogs);
+	}, PREFERENCE_UPLOAD_INTERVAL_MS);
+}
+
+function stopPreferenceUploadInterval(): void {
+	if (preferenceUploadIntervalId) {
+		clearInterval(preferenceUploadIntervalId);
+		preferenceUploadIntervalId = null;
+	}
+}
+
+function initializePreferenceUploadIdentity(context: vscode.ExtensionContext): void {
+	const rawVersion = context.extension.packageJSON.version;
+	preferenceUploadExtensionVersion = typeof rawVersion === 'string'
+		? rawVersion
+		: '0.0.0';
+
+	const machineId = vscode.env.machineId || 'unknown-machine';
+	const userName = process.env.USER || process.env.USERNAME || 'coder';
+	const plainUserId = `${machineId}-${userName}`;
+	preferenceUploadUserId = plainUserId;
+	void context.globalState.update('crowdPilot.preferenceUploadUserId', plainUserId);
+}
+
+async function getLatestIndexedPreferenceLogPath(): Promise<string | null> {
+	const target = getPreferenceLogTarget();
+	const files = await listIndexedPreferenceLogFiles(target);
+	if (files.length === 0) {
+		return null;
+	}
+	return files[files.length - 1].filePath;
 }
 
 function createModelLogId(): string {
@@ -178,15 +560,10 @@ function appendPreferenceLogRecord(record: unknown, successMessage: string): voi
 		console.log('[crowd-pilot] Preference logging disabled, skipping record');
 		return;
 	}
-
-	const logPath = getPreferenceLogPath();
 	const line = JSON.stringify(record) + '\n';
-	fs.appendFile(logPath, line, (err) => {
-		if (err) {
-			console.error('[crowd-pilot] Failed to append preference record:', err);
-		} else {
-			console.log(successMessage);
-		}
+	void enqueuePreferenceLogTask(async () => {
+		await appendPreferenceLogLine(line);
+		console.log(successMessage);
 	});
 }
 
@@ -202,6 +579,10 @@ function logRejectFollowupSample(sample: RejectFollowupSample): void {
 	appendPreferenceLogRecord(sample, `[crowd-pilot] Logged reject followup sample for ${sample.sampleId}`);
 }
 
+function logAcceptFollowupSample(sample: AcceptFollowupSample): void {
+	appendPreferenceLogRecord(sample, `[crowd-pilot] Logged accept followup sample for ${sample.sampleId}`);
+}
+
 function captureEditorFileState(editor: vscode.TextEditor): PreferenceFileState {
 	const doc = editor.document;
 	return {
@@ -214,6 +595,28 @@ function captureEditorFileState(editor: vscode.TextEditor): PreferenceFileState 
 			start: [selection.start.line, selection.start.character],
 			end: [selection.end.line, selection.end.character],
 		})),
+	};
+}
+
+function captureFileStateByUri(docUri: string): PreferenceFileState | null {
+	const doc = vscode.workspace.textDocuments.find((textDoc) => textDoc.uri.toString() === docUri);
+	if (!doc) {
+		return null;
+	}
+	const activeEditor = vscode.window.activeTextEditor;
+	const selections = activeEditor?.document.uri.toString() === docUri
+		? activeEditor.selections.map((selection) => ({
+			start: [selection.start.line, selection.start.character] as [number, number],
+			end: [selection.end.line, selection.end.character] as [number, number],
+		}))
+		: [];
+	return {
+		uri: doc.uri.toString(),
+		fsPath: doc.uri.fsPath,
+		languageId: doc.languageId,
+		version: doc.version,
+		text: doc.getText(),
+		selections,
 	};
 }
 
@@ -286,6 +689,110 @@ function markPendingAsIgnored(): void {
 	}
 }
 
+function isEditAction(action: Action): action is Extract<Action, { kind: 'editInsert' | 'editReplace' | 'editDelete' }> {
+	return action.kind === 'editInsert' || action.kind === 'editReplace' || action.kind === 'editDelete';
+}
+
+function countLogicalLines(text: string): number {
+	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	const withoutTrailingNewline = normalized.endsWith('\n')
+		? normalized.slice(0, -1)
+		: normalized;
+	if (withoutTrailingNewline.length === 0) {
+		return 0;
+	}
+	return withoutTrailingNewline.split('\n').length;
+}
+
+function clampLine(line: number, lineCount: number): number {
+	if (lineCount <= 0) {
+		return 0;
+	}
+	return Math.min(Math.max(line, 0), lineCount - 1);
+}
+
+function actionAcceptedLineRegion(action: Extract<Action, { kind: 'editInsert' | 'editReplace' | 'editDelete' }>, lineCount: number): {
+	startLine: number;
+	endLine: number;
+} | null {
+	if (action.kind === 'editInsert') {
+		const insertedLineCount = countLogicalLines(action.text);
+		if (insertedLineCount <= 0) {
+			return null;
+		}
+		const startLine = clampLine(action.position[0], lineCount);
+		const endLine = clampLine(startLine + insertedLineCount - 1, lineCount);
+		return { startLine, endLine };
+	}
+	if (action.kind === 'editReplace') {
+		const startLine = clampLine(action.range.start[0], lineCount);
+		const insertedLineCount = countLogicalLines(action.text);
+		const endLine = insertedLineCount > 0
+			? clampLine(startLine + insertedLineCount - 1, lineCount)
+			: startLine;
+		return { startLine, endLine };
+	}
+	const startLine = clampLine(action.range.start[0], lineCount);
+	return { startLine, endLine: startLine };
+}
+
+function rangesOverlap(startA: number, endA: number, startB: number, endB: number): boolean {
+	return startA <= endB && startB <= endA;
+}
+
+function calculateFollowupStats(edits: RejectFollowupEditEvent[]): {
+	editEventCount: number;
+	contentChangeCount: number;
+	charsInserted: number;
+	charsDeleted: number;
+} {
+	let contentChangeCount = 0;
+	let charsInserted = 0;
+	let charsDeleted = 0;
+	for (const edit of edits) {
+		contentChangeCount += edit.contentChanges.length;
+		for (const change of edit.contentChanges) {
+			charsInserted += change.text.length;
+			charsDeleted += change.rangeLength;
+		}
+	}
+	return {
+		editEventCount: edits.length,
+		contentChangeCount,
+		charsInserted,
+		charsDeleted,
+	};
+}
+
+function extractTextForLineRange(text: string, startLine: number, endLine: number): string {
+	const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+	const lines = normalized.split('\n');
+	if (lines.length === 0) {
+		return '';
+	}
+	const clampedStart = clampLine(startLine, lines.length);
+	const clampedEnd = clampLine(endLine, lines.length);
+	if (clampedEnd < clampedStart) {
+		return '';
+	}
+	return lines.slice(clampedStart, clampedEnd + 1).join('\n');
+}
+
+function computeCharEditDistance(a: string, b: string): number | null {
+	const maxProduct = 4_000_000;
+	if (a.length * b.length > maxProduct) {
+		return null;
+	}
+	const segments = diffChars(a, b);
+	let distance = 0;
+	for (const segment of segments) {
+		if (segment.type === 'insert' || segment.type === 'delete') {
+			distance += segment.value.length;
+		}
+	}
+	return distance;
+}
+
 function clearRejectCaptureState(): void {
 	if (rejectCaptureState?.cursorMoveTimer) {
 		clearTimeout(rejectCaptureState.cursorMoveTimer);
@@ -318,30 +825,6 @@ function resetRejectCaptureTimer(state: ActiveRejectCaptureState): void {
 	}, pauseMs);
 }
 
-function calculateRejectFollowupStats(edits: RejectFollowupEditEvent[]): {
-	editEventCount: number;
-	contentChangeCount: number;
-	charsInserted: number;
-	charsDeleted: number;
-} {
-	let contentChangeCount = 0;
-	let charsInserted = 0;
-	let charsDeleted = 0;
-	for (const edit of edits) {
-		contentChangeCount += edit.contentChanges.length;
-		for (const change of edit.contentChanges) {
-			charsInserted += change.text.length;
-			charsDeleted += change.rangeLength;
-		}
-	}
-	return {
-		editEventCount: edits.length,
-		contentChangeCount,
-		charsInserted,
-		charsDeleted,
-	};
-}
-
 function finalizeRejectCapture(
 	stopReason: RejectFollowupStopReason,
 	anotherActionType: RejectFollowupAnotherActionType | null
@@ -369,7 +852,7 @@ function finalizeRejectCapture(
 		anotherActionType,
 		docUri: state.docUri,
 		edits: state.edits,
-		stats: calculateRejectFollowupStats(state.edits),
+		stats: calculateFollowupStats(state.edits),
 	};
 	logRejectFollowupSample(followup);
 }
@@ -514,14 +997,238 @@ function recordRejectAndArmCapture(source: 'escape_dismiss' | 'quickpick_dismiss
 	armRejectCapture(recorded.sampleId, recorded.outcomeTimestamp);
 }
 
+function clearAcceptCaptureState(): void {
+	if (acceptCaptureState?.inactivityTimer) {
+		clearTimeout(acceptCaptureState.inactivityTimer);
+	}
+	acceptCaptureState = null;
+}
+
+function resetAcceptCaptureTimer(): void {
+	if (!acceptCaptureState) {
+		return;
+	}
+	if (acceptCaptureState.inactivityTimer) {
+		clearTimeout(acceptCaptureState.inactivityTimer);
+	}
+	const rawPauseMs = getConfig().acceptFollowupPauseMs;
+	const pauseMs = Number.isFinite(rawPauseMs) ? Math.max(0, Math.floor(rawPauseMs)) : 5000;
+	acceptCaptureState.inactivityTimer = setTimeout(() => {
+		finalizeAcceptCapture('pause', null);
+	}, pauseMs);
+}
+
+function classifyAcceptRelationship(state: ActiveAcceptCaptureState): AcceptFollowupRelationship {
+	if (state.edits.length === 0) {
+		return 'none';
+	}
+	if (state.touchedRegionChangeCount > 0 && state.outsideRegionChangeCount === 0) {
+		return 'refinement';
+	}
+	if (state.outsideRegionChangeCount > 0 && state.touchedRegionChangeCount === 0) {
+		return 'continuation';
+	}
+	return 'mixed';
+}
+
+function finalizeAcceptCapture(
+	stopReason: AcceptFollowupStopReason,
+	anotherActionType: AcceptFollowupAnotherActionType | null
+): void {
+	if (!acceptCaptureState) {
+		return;
+	}
+	const state = acceptCaptureState;
+	clearAcceptCaptureState();
+
+	const finalFileState = captureFileStateByUri(state.docUri) ?? state.baseFileState;
+	const baseRegionText = extractTextForLineRange(
+		state.baseFileState.text,
+		state.initialRegionStartLine,
+		state.initialRegionEndLine
+	);
+	const finalRegionText = extractTextForLineRange(
+		finalFileState.text,
+		state.regionStartLine,
+		state.regionEndLine
+	);
+
+	const followup: AcceptFollowupSample = {
+		type: 'accept_followup',
+		sampleId: state.sampleId,
+		acceptedAt: state.acceptedAt,
+		firstEditAt: state.firstEditAt,
+		endedAt: Date.now(),
+		stopReason,
+		anotherActionType,
+		docUri: state.docUri,
+		initialRegion: {
+			startLine: state.initialRegionStartLine,
+			endLine: state.initialRegionEndLine,
+		},
+		finalRegion: {
+			startLine: state.regionStartLine,
+			endLine: state.regionEndLine,
+		},
+		baseFileState: state.baseFileState,
+		finalFileState,
+		edits: state.edits,
+		relationship: classifyAcceptRelationship(state),
+		stats: calculateFollowupStats(state.edits),
+		metrics: {
+			acceptedRegionCharEditDistance: computeCharEditDistance(baseRegionText, finalRegionText),
+			fullFileCharEditDistance: computeCharEditDistance(state.baseFileState.text, finalFileState.text),
+		},
+	};
+	logAcceptFollowupSample(followup);
+}
+
+function stopAcceptCaptureForAnotherAction(actionType: AcceptFollowupAnotherActionType): void {
+	if (!acceptCaptureState) {
+		return;
+	}
+	finalizeAcceptCapture('another_action', actionType);
+}
+
+function startAcceptCapture(
+	sampleId: string,
+	acceptedAt: number,
+	action: Action
+): void {
+	stopAcceptCaptureForAnotherAction('new_suggestion');
+	if (!isEditAction(action)) {
+		return;
+	}
+	const editor = vscode.window.activeTextEditor;
+	if (!editor) {
+		return;
+	}
+	const region = actionAcceptedLineRegion(action, editor.document.lineCount);
+	if (!region) {
+		return;
+	}
+	acceptCaptureState = {
+		sampleId,
+		acceptedAt,
+		docUri: editor.document.uri.toString(),
+		baseFileState: captureEditorFileState(editor),
+		initialRegionStartLine: region.startLine,
+		initialRegionEndLine: region.endLine,
+		regionStartLine: region.startLine,
+		regionEndLine: region.endLine,
+		edits: [],
+		firstEditAt: null,
+		inactivityTimer: null,
+		pendingSelectionSkipVersion: null,
+		touchedRegionChangeCount: 0,
+		outsideRegionChangeCount: 0,
+	};
+	resetAcceptCaptureTimer();
+}
+
+function captureAcceptFollowupEdit(e: vscode.TextDocumentChangeEvent): void {
+	if (!acceptCaptureState || e.contentChanges.length === 0) {
+		return;
+	}
+	if (acceptCaptureState.docUri !== e.document.uri.toString()) {
+		stopAcceptCaptureForAnotherAction('file_switch');
+		return;
+	}
+
+	for (const change of e.contentChanges) {
+		const oldStartLine = change.range.start.line;
+		const oldEndLine = change.range.end.line;
+		const oldLineCount = change.rangeLength === 0
+			? 0
+			: Math.max(1, oldEndLine - oldStartLine + 1);
+		const newLineCount = countLogicalLines(change.text);
+		const lineDelta = newLineCount - oldLineCount;
+
+		if (oldEndLine < acceptCaptureState.regionStartLine && lineDelta !== 0) {
+			acceptCaptureState.regionStartLine = Math.max(0, acceptCaptureState.regionStartLine + lineDelta);
+			acceptCaptureState.regionEndLine = Math.max(
+				acceptCaptureState.regionStartLine,
+				acceptCaptureState.regionEndLine + lineDelta
+			);
+		}
+
+		const touchesRegion = rangesOverlap(
+			oldStartLine,
+			oldEndLine,
+			acceptCaptureState.regionStartLine,
+			acceptCaptureState.regionEndLine
+		);
+		if (touchesRegion) {
+			acceptCaptureState.touchedRegionChangeCount += 1;
+			const newEndLine = oldStartLine + Math.max(newLineCount - 1, 0);
+			acceptCaptureState.regionStartLine = Math.max(0, Math.min(acceptCaptureState.regionStartLine, oldStartLine));
+			acceptCaptureState.regionEndLine = Math.max(
+				acceptCaptureState.regionStartLine,
+				Math.max(acceptCaptureState.regionEndLine, newEndLine)
+			);
+		} else {
+			stopAcceptCaptureForAnotherAction('cursor_far');
+			return;
+		}
+	}
+
+	const now = Date.now();
+	if (acceptCaptureState.firstEditAt === null) {
+		acceptCaptureState.firstEditAt = now;
+	}
+	const editEvent: RejectFollowupEditEvent = {
+		ts: now,
+		docVersion: e.document.version,
+		contentChanges: e.contentChanges.map((change) => ({
+			rangeOffset: change.rangeOffset,
+			rangeLength: change.rangeLength,
+			text: change.text,
+		})),
+	};
+	acceptCaptureState.edits.push(editEvent);
+	acceptCaptureState.pendingSelectionSkipVersion = e.document.version;
+	resetAcceptCaptureTimer();
+}
+
+function handleAcceptCaptureSelectionChange(e: vscode.TextEditorSelectionChangeEvent): void {
+	if (!acceptCaptureState) {
+		return;
+	}
+	if (acceptCaptureState.docUri !== e.textEditor.document.uri.toString()) {
+		stopAcceptCaptureForAnotherAction('file_switch');
+		return;
+	}
+	if (
+		acceptCaptureState.pendingSelectionSkipVersion !== null
+		&& acceptCaptureState.pendingSelectionSkipVersion === e.textEditor.document.version
+	) {
+		acceptCaptureState.pendingSelectionSkipVersion = null;
+		return;
+	}
+
+	const cursorLine = e.textEditor.selection.active.line;
+	if (cursorLine < acceptCaptureState.regionStartLine || cursorLine > acceptCaptureState.regionEndLine) {
+		stopAcceptCaptureForAnotherAction('cursor_far');
+	}
+}
+
+function handleAcceptCaptureEditorSwitch(editor: vscode.TextEditor | undefined): void {
+	if (!acceptCaptureState) {
+		return;
+	}
+	if (!editor || editor.document.uri.toString() !== acceptCaptureState.docUri) {
+		stopAcceptCaptureForAnotherAction('file_switch');
+	}
+}
+
 
 // Configuration helper
 function getConfig() {
 	const config = vscode.workspace.getConfiguration('crowd-pilot');
-	return {
-		hostname: config.get<string>('hostname', 'hai001'),
-		port: config.get<number>('port', 30000),
-		basePath: config.get<string>('basePath', '/v1/chat/completions'),
+		return {
+			hostname: config.get<string>('hostname', 'hai001'),
+			port: config.get<number>('port', 30000),
+			basePath: config.get<string>('basePath', '/v1/chat/completions'),
 		modelName: config.get<string>('modelName', 'qwen/qwen3-8b'),
 		minAvgLogprob: config.get<number>('minAvgLogprob', -1.0),
 		enableModelLogging: config.get<boolean>('enableModelLogging', false),
@@ -529,11 +1236,13 @@ function getConfig() {
 		enablePreferenceLogging: config.get<boolean>('enablePreferenceLogging', true),
 		sweepViewportLines: config.get<number>('sweepViewportLines', 21),
 		sweepOpenedFileContext: config.get<string>('sweepOpenedFileContext', 'full'),
-		sweepHistoryCenter: config.get<string>('sweepHistoryCenter', 'changed'),
-		sweepMaxHistoryEntries: config.get<number>('sweepMaxHistoryEntries', 64),
-		rejectFollowupPauseMs: config.get<number>('rejectFollowupPauseMs', 5000),
-	};
-}
+			sweepHistoryCenter: config.get<string>('sweepHistoryCenter', 'changed'),
+			sweepMaxHistoryEntries: config.get<number>('sweepMaxHistoryEntries', 64),
+			rejectFollowupPauseMs: config.get<number>('rejectFollowupPauseMs', 5000),
+			acceptFollowupPauseMs: config.get<number>('acceptFollowupPauseMs', 5000),
+			enablePreferenceUpload: config.get<boolean>('enablePreferenceUpload', true),
+		};
+	}
 
 
 // Global conversation state manager instance
@@ -555,6 +1264,7 @@ function clearContext(): void {
 	activatedFiles.clear();
 	lastPredictionContext = null;
 	clearRejectCaptureState();
+	clearAcceptCaptureState();
 	console.log('[crowd-pilot] Context cleared');
 }
 
@@ -585,6 +1295,9 @@ export function activate(context: vscode.ExtensionContext) {
 		historyCenter: cfg.sweepHistoryCenter,
 		maxHistoryEntries: cfg.sweepMaxHistoryEntries,
 	});
+	initializePreferenceUploadIdentity(context);
+	startPreferenceUploadInterval();
+	void enqueuePreferenceLogTask(uploadAllLocalPreferenceLogs);
 
 	previewManager = new PreviewManager();
 	previewManager.register(context);
@@ -630,6 +1343,7 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const hideUi = vscode.commands.registerCommand('crowd-pilot.hideUi', () => {
+		stopAcceptCaptureForAnotherAction('new_suggestion');
 		recordRejectAndArmCapture('escape_dismiss');
 		hidePreviewUI(true);
 	});
@@ -640,8 +1354,12 @@ export function activate(context: vscode.ExtensionContext) {
 	});
 
 	const openPreferenceLogCmd = vscode.commands.registerCommand('crowd-pilot.openPreferenceLog', async () => {
-		const logPath = getPreferenceLogPath();
 		try {
+			const logPath = await getLatestIndexedPreferenceLogPath();
+			if (!logPath) {
+				vscode.window.showInformationMessage('[crowd-pilot] No preference log file exists yet. Accept or reject some suggestions first.');
+				return;
+			}
 			const uri = vscode.Uri.file(logPath);
 			await vscode.window.showTextDocument(uri);
 		} catch (err: any) {
@@ -670,10 +1388,14 @@ export function activate(context: vscode.ExtensionContext) {
 				hidePreviewUI();
 				return;
 			}
-			recordPreferenceOutcome('accepted', 'tab_accept');
+			stopAcceptCaptureForAnotherAction('new_suggestion');
+			const recorded = recordPreferenceOutcome('accepted', 'tab_accept');
 			clearRejectCaptureState();
 			hidePreviewUI(false);
 			await executeAction(action);
+			if (recorded) {
+				startAcceptCapture(recorded.sampleId, recorded.outcomeTimestamp, action);
+			}
 			autoShowNextAction();
 		} catch (err) {
 			const errorMessage = err instanceof Error ? err.message : String(err);
@@ -689,12 +1411,17 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 		const result = await previewManager.showQuickPick();
 		if (result === 'accept') {
-			recordPreferenceOutcome('accepted', 'quickpick_accept');
+			stopAcceptCaptureForAnotherAction('new_suggestion');
+			const recorded = recordPreferenceOutcome('accepted', 'quickpick_accept');
 			clearRejectCaptureState();
 			hidePreviewUI(false);
 			await executeAction(currentAction);
+			if (recorded) {
+				startAcceptCapture(recorded.sampleId, recorded.outcomeTimestamp, currentAction);
+			}
 			autoShowNextAction();
 		} else if (result === 'dismiss') {
+			stopAcceptCaptureForAnotherAction('new_suggestion');
 			recordRejectAndArmCapture('quickpick_dismiss');
 			hidePreviewUI(true);
 		}
@@ -712,6 +1439,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const onSelChange = vscode.window.onDidChangeTextEditorSelection((e) => {
 		if (e.textEditor === vscode.window.activeTextEditor) {
 			handleRejectCaptureSelectionChange(e);
+			handleAcceptCaptureSelectionChange(e);
 			suppressAutoPreview = false;
 			schedulePredictionRefresh(true, false);
 
@@ -727,6 +1455,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 	const onActiveChange = vscode.window.onDidChangeActiveTextEditor((editor) => {
 		handleRejectCaptureEditorSwitch(editor);
+		handleAcceptCaptureEditorSwitch(editor);
 		suppressAutoPreview = false;
 		schedulePredictionRefresh(true, false);
 
@@ -747,6 +1476,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const onDocChange = vscode.workspace.onDidChangeTextDocument((e) => {
 		if (vscode.window.activeTextEditor?.document === e.document) {
 			captureRejectFollowupEdit(e);
+			captureAcceptFollowupEdit(e);
 			suppressAutoPreview = false;
 			schedulePredictionRefresh(true, false);
 
@@ -764,6 +1494,7 @@ export function activate(context: vscode.ExtensionContext) {
 	const onTerminalChange = vscode.window.onDidChangeActiveTerminal((terminal) => {
 		if (terminal) {
 			stopRejectCaptureForAnotherAction('terminal_focus');
+			stopAcceptCaptureForAnotherAction('terminal_focus');
 			conversationManager.handleTerminalFocusEvent();
 		}
 	});
@@ -771,6 +1502,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// Terminal command execution event
 	const onTerminalCommand = vscode.window.onDidStartTerminalShellExecution(async (event) => {
 		stopRejectCaptureForAnotherAction('terminal_command');
+		stopAcceptCaptureForAnotherAction('terminal_command');
 		const commandLine = event.execution.commandLine.value;
 		conversationManager.handleTerminalCommandEvent(commandLine);
 
@@ -807,8 +1539,11 @@ export function activate(context: vscode.ExtensionContext) {
 	}
 }
 
-export function deactivate() {
+export async function deactivate() {
+	stopPreferenceUploadInterval();
+	await enqueuePreferenceLogTask(uploadAllLocalPreferenceLogs);
 	clearRejectCaptureState();
+	clearAcceptCaptureState();
 	previewManager?.dispose();
 }
 
