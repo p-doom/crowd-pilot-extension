@@ -1,3 +1,3 @@
-# crowd-pilot-extension
+# code-tab
 
-This is the Cursor/VS Code extension of crowd-pilot.
+This is the Cursor/VS Code extension of code-tab.
